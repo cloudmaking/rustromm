@@ -1,0 +1,858 @@
+//! egui front-end and all UI state.
+//!
+//! Threading model: every network call runs on a detached `std::thread` and
+//! reports back through an mpsc channel, followed by `ctx.request_repaint()`.
+//! The UI thread never blocks on IO, and there is no async runtime to carry.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use crate::api::{Api, PAGE_SIZE};
+use crate::config::Config;
+use crate::launch;
+use crate::models::{Page, Platform, Rom, human_size};
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Screen {
+    Connect,
+    Library,
+    Settings,
+}
+
+/// Results coming back from worker threads.
+enum Msg {
+    Connected(Api, String),
+    ConnectFailed(String),
+    Platforms(Vec<Platform>),
+    Roms { page: Page<Rom>, offset: i64 },
+    Failed(String),
+    Cover(i64, Option<Arc<[u8]>>),
+    Progress(i64, u64, Option<u64>),
+    Downloaded(i64, PathBuf),
+    DownloadFailed(i64, String),
+}
+
+struct Download {
+    done: u64,
+    total: Option<u64>,
+    cancel: Arc<AtomicBool>,
+    finished: Option<PathBuf>,
+    error: Option<String>,
+}
+
+impl Download {
+    fn fraction(&self) -> Option<f32> {
+        match self.total {
+            Some(t) if t > 0 => Some((self.done as f32 / t as f32).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+}
+
+pub struct RustRomm {
+    config: Config,
+    api: Option<Api>,
+    screen: Screen,
+
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+
+    // Connect screen
+    connecting: bool,
+    connect_error: Option<String>,
+    server_version: Option<String>,
+
+    // Library
+    platforms: Vec<Platform>,
+    selected_platform: Option<i64>,
+    roms: Vec<Rom>,
+    total_roms: i64,
+    offset: i64,
+    search: String,
+    /// The search text that produced the currently displayed page. Used to tell
+    /// "user is mid-typing" from "results are stale and need refetching".
+    applied_search: String,
+    loading: bool,
+    error: Option<String>,
+
+    covers: HashMap<i64, Option<Arc<[u8]>>>,
+    cover_requested: HashSet<i64>,
+
+    downloads: HashMap<i64, Download>,
+    status: Option<String>,
+}
+
+impl RustRomm {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_config(&cc.egui_ctx, Config::load())
+    }
+
+    /// Construct with an explicit config and bare `egui::Context`.
+    ///
+    /// Split out from `new` so tests can build the app without an
+    /// `eframe::CreationContext`, which can't be constructed outside eframe.
+    pub fn with_config(egui_ctx: &egui::Context, config: Config) -> Self {
+        let (tx, rx) = channel();
+
+        // Slightly roomier than egui's default; this is a browsing app.
+        // `all_styles_mut` applies to both the light and dark themes.
+        egui_ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        });
+
+        let mut app = Self {
+            config,
+            api: None,
+            screen: Screen::Connect,
+            tx,
+            rx,
+            connecting: false,
+            connect_error: None,
+            server_version: None,
+            platforms: Vec::new(),
+            selected_platform: None,
+            roms: Vec::new(),
+            total_roms: 0,
+            offset: 0,
+            search: String::new(),
+            applied_search: String::new(),
+            loading: false,
+            error: None,
+            covers: HashMap::new(),
+            cover_requested: HashSet::new(),
+            downloads: HashMap::new(),
+            status: None,
+        };
+
+        // Saved credentials mean we can go straight to the library.
+        if !app.config.server_url.is_empty()
+            && !app.config.username.is_empty()
+            && !app.config.password.is_empty()
+        {
+            app.start_connect(egui_ctx);
+        }
+        app
+    }
+
+    /// Which screen is showing. Exposed for tests.
+    pub fn on_connect_screen(&self) -> bool {
+        self.screen == Screen::Connect
+    }
+
+    pub fn on_library_screen(&self) -> bool {
+        self.screen == Screen::Library
+    }
+
+    /// Number of games in the currently displayed page. Exposed for tests.
+    pub fn visible_rom_count(&self) -> usize {
+        self.roms.len()
+    }
+
+    pub fn total_rom_count(&self) -> i64 {
+        self.total_roms
+    }
+
+    pub fn platform_count(&self) -> usize {
+        self.platforms.len()
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.error.as_deref().or(self.connect_error.as_deref())
+    }
+
+    /// Block until every queued background message has been folded into state,
+    /// or `timeout` elapses. Tests need this because the worker threads are
+    /// genuinely asynchronous; production code just drains what has arrived.
+    pub fn pump_until<F>(
+        &mut self,
+        ctx: &egui::Context,
+        timeout: std::time::Duration,
+        done: F,
+    ) -> bool
+    where
+        F: Fn(&Self) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.drain_messages(ctx);
+            if done(self) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Render one frame. Same path `eframe::App::ui` takes.
+    pub fn render(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.drain_messages(&ctx);
+        match self.screen {
+            Screen::Connect => self.connect_screen(ui),
+            Screen::Library => self.library_screen(ui),
+            Screen::Settings => self.settings_screen(ui),
+        }
+    }
+
+    /// Kick off a connection using the current config. Exposed for tests.
+    pub fn connect(&mut self, ctx: &egui::Context) {
+        self.start_connect(ctx);
+    }
+
+    fn start_connect(&mut self, ctx: &egui::Context) {
+        self.connecting = true;
+        self.connect_error = None;
+
+        let (url, user, pass) = (
+            self.config.server_url.clone(),
+            self.config.username.clone(),
+            self.config.password.clone(),
+        );
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match Api::new(&url, &user, &pass) {
+                Ok(api) => match api.check_connection() {
+                    Ok(version) => Msg::Connected(api, version),
+                    Err(e) => Msg::ConnectFailed(format!("{e:#}")),
+                },
+                Err(e) => Msg::ConnectFailed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn fetch_platforms(&self, ctx: &egui::Context) {
+        let Some(api) = self.api.clone() else { return };
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match api.platforms() {
+                Ok(mut p) => {
+                    // Empty platforms are noise in the sidebar.
+                    p.retain(|x| x.rom_count > 0);
+                    p.sort_by(|a, b| {
+                        a.display_name()
+                            .to_lowercase()
+                            .cmp(&b.display_name().to_lowercase())
+                    });
+                    Msg::Platforms(p)
+                }
+                Err(e) => Msg::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn fetch_roms(&mut self, ctx: &egui::Context, offset: i64) {
+        let Some(api) = self.api.clone() else { return };
+        self.loading = true;
+        self.error = None;
+        self.applied_search = self.search.clone();
+
+        let platform = self.selected_platform;
+        let search = self.search.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match api.roms(platform, &search, offset) {
+                Ok(page) => Msg::Roms { page, offset },
+                Err(e) => Msg::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn request_cover(&mut self, ctx: &egui::Context, rom: &Rom) {
+        if self.cover_requested.contains(&rom.id) {
+            return;
+        }
+        let Some(path) = rom.cover_path().map(str::to_string) else {
+            self.cover_requested.insert(rom.id);
+            self.covers.insert(rom.id, None);
+            return;
+        };
+        let Some(api) = self.api.clone() else { return };
+        self.cover_requested.insert(rom.id);
+
+        let id = rom.id;
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let bytes = api.cover(&path).map(|b| Arc::from(b.into_boxed_slice()));
+            let _ = tx.send(Msg::Cover(id, bytes));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_download(&mut self, ctx: &egui::Context, rom: &Rom) {
+        let Some(api) = self.api.clone() else { return };
+        let dir = self.config.resolved_download_dir().join(&rom.platform_slug);
+        let dest = dir.join(rom.download_file_name());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.downloads.insert(
+            rom.id,
+            Download {
+                done: 0,
+                total: None,
+                cancel: cancel.clone(),
+                finished: None,
+                error: None,
+            },
+        );
+
+        let rom = rom.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let id = rom.id;
+            // Throttle progress messages: a 128 KB read loop on a fast local
+            // server would otherwise flood the channel and repaint constantly.
+            let mut last_sent = 0u64;
+            let result = api.download_rom(&rom, &dest, &cancel, |done, total| {
+                if done - last_sent >= 512 * 1024 || Some(done) == total {
+                    last_sent = done;
+                    let _ = tx.send(Msg::Progress(id, done, total));
+                    ctx.request_repaint();
+                }
+            });
+            let msg = match result {
+                Ok(()) => Msg::Downloaded(id, dest),
+                Err(e) => Msg::DownloadFailed(id, format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn drain_messages(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::Connected(api, version) => {
+                    self.connecting = false;
+                    self.api = Some(api);
+                    self.server_version = Some(version);
+                    self.screen = Screen::Library;
+                    if let Err(e) = self.config.save() {
+                        self.status =
+                            Some(format!("Connected, but settings could not be saved: {e:#}"));
+                    }
+                    self.fetch_platforms(ctx);
+                    self.fetch_roms(ctx, 0);
+                }
+                Msg::ConnectFailed(e) => {
+                    self.connecting = false;
+                    self.connect_error = Some(e);
+                }
+                Msg::Platforms(p) => self.platforms = p,
+                Msg::Roms { page, offset } => {
+                    self.loading = false;
+                    self.total_roms = page.total;
+                    self.roms = page.items;
+                    self.offset = offset;
+                }
+                Msg::Failed(e) => {
+                    self.loading = false;
+                    self.error = Some(e);
+                }
+                Msg::Cover(id, bytes) => {
+                    self.covers.insert(id, bytes);
+                }
+                Msg::Progress(id, done, total) => {
+                    if let Some(d) = self.downloads.get_mut(&id) {
+                        d.done = done;
+                        d.total = total;
+                    }
+                }
+                Msg::Downloaded(id, path) => {
+                    if let Some(d) = self.downloads.get_mut(&id) {
+                        d.finished = Some(path.clone());
+                    }
+                    self.status = Some(format!("Saved to {}", path.display()));
+                }
+                Msg::DownloadFailed(id, e) => {
+                    if let Some(d) = self.downloads.get_mut(&id) {
+                        d.error = Some(e.clone());
+                    }
+                    self.status = Some(format!("Download failed: {e}"));
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for RustRomm {
+    // egui 0.35 hands the app a root `Ui` rather than the `Context`; panels are
+    // nested inside it instead of being registered against the context.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl RustRomm {
+    fn connect_screen(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        let ctx = &ctx;
+        egui::CentralPanel::default_margins().show(root, |ui| {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("RustRomM");
+                ui.label(egui::RichText::new("A desktop client for your RomM library").weak());
+            });
+            ui.add_space(24.0);
+
+            // Keep the form to a readable column rather than stretching it.
+            let width = 420.0_f32.min(ui.available_width() - 40.0);
+            ui.vertical_centered(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.label("Server address");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.server_url)
+                                .hint_text("192.168.1.10:8087")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(10.0);
+
+                        ui.label("Username");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.username)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(10.0);
+
+                        ui.label("Password");
+                        let pw = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.password)
+                                .password(true)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.config.remember_password, "Remember password");
+
+                        ui.add_space(16.0);
+                        let submitted =
+                            pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let clicked = ui
+                            .add_enabled(
+                                !self.connecting,
+                                egui::Button::new(if self.connecting {
+                                    "Connecting…"
+                                } else {
+                                    "Connect"
+                                })
+                                .min_size(egui::vec2(width, 34.0)),
+                            )
+                            .clicked();
+
+                        if (clicked || submitted) && !self.connecting {
+                            self.start_connect(ctx);
+                        }
+
+                        if let Some(err) = &self.connect_error {
+                            ui.add_space(12.0);
+                            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+                        }
+                    },
+                );
+            });
+        });
+    }
+
+    fn library_screen(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        let ctx = &ctx;
+
+        // Actions are collected during the UI pass and applied afterwards, so
+        // nothing mutates `self` while a widget still borrows part of it.
+        let mut want_fetch: Option<i64> = None;
+        let mut to_download: Option<Rom> = None;
+        let mut to_launch: Option<(Rom, PathBuf)> = None;
+        let mut to_reveal: Option<PathBuf> = None;
+        let mut covers_needed: Vec<Rom> = Vec::new();
+
+        egui::Panel::top("top").show(root, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("RustRomM");
+                ui.separator();
+
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Search the library…")
+                        .desired_width(260.0),
+                );
+                if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    want_fetch = Some(0);
+                }
+                if ui.button("Search").clicked() {
+                    want_fetch = Some(0);
+                }
+                if !self.search.is_empty() && ui.button("Clear").clicked() {
+                    self.search.clear();
+                    want_fetch = Some(0);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Settings").clicked() {
+                        self.screen = Screen::Settings;
+                    }
+                    if let Some(v) = &self.server_version {
+                        ui.label(egui::RichText::new(format!("RomM {v}")).weak());
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::Panel::left("platforms")
+            .resizable(true)
+            .default_size(210.0)
+            .show(root, |ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("PLATFORMS").small().strong());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let all = self.selected_platform.is_none();
+                    if ui
+                        .selectable_label(all, format!("All games ({})", self.total_roms))
+                        .clicked()
+                        && !all
+                    {
+                        self.selected_platform = None;
+                        want_fetch = Some(0);
+                    }
+                    ui.separator();
+                    for p in &self.platforms {
+                        let selected = self.selected_platform == Some(p.id);
+                        let label = format!("{} ({})", p.display_name(), p.rom_count);
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            self.selected_platform = Some(p.id);
+                            want_fetch = Some(0);
+                        }
+                    }
+                });
+            });
+
+        egui::Panel::bottom("status").show(root, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let active = self
+                    .downloads
+                    .values()
+                    .filter(|d| d.finished.is_none() && d.error.is_none())
+                    .count();
+                if active > 0 {
+                    ui.spinner();
+                    ui.label(format!("{active} download(s) in progress"));
+                    ui.separator();
+                }
+                match &self.status {
+                    Some(s) => {
+                        ui.label(egui::RichText::new(s).weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new(format!("{} games", self.total_roms)).weak());
+                    }
+                }
+            });
+            ui.add_space(3.0);
+        });
+
+        egui::CentralPanel::default_margins().show(root, |ui| {
+            if let Some(err) = &self.error {
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+                ui.separator();
+            }
+            if self.loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading…");
+                });
+                return;
+            }
+            if self.roms.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(if self.applied_search.is_empty() {
+                        "No games here yet."
+                    } else {
+                        "Nothing matched that search."
+                    });
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for rom in &self.roms {
+                    let dl = self.downloads.get(&rom.id);
+                    ui.horizontal(|ui| {
+                        // Cover
+                        let size = egui::vec2(48.0, 64.0);
+                        match self.covers.get(&rom.id) {
+                            Some(Some(bytes)) => {
+                                ui.add_sized(
+                                    size,
+                                    egui::Image::from_bytes(
+                                        format!("bytes://cover-{}", rom.id),
+                                        bytes.clone(),
+                                    )
+                                    .maintain_aspect_ratio(true),
+                                );
+                            }
+                            Some(None) => {
+                                ui.allocate_space(size);
+                            }
+                            None => {
+                                covers_needed.push(rom.clone());
+                                ui.allocate_space(size);
+                            }
+                        }
+
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(rom.title()).strong());
+                            let mut meta = format!(
+                                "{} · {}",
+                                rom.platform_display_name,
+                                human_size(rom.fs_size_bytes)
+                            );
+                            if rom.missing_from_fs {
+                                meta.push_str(" · missing on server");
+                            }
+                            ui.label(egui::RichText::new(meta).weak().small());
+
+                            if let Some(d) = dl {
+                                if let Some(err) = &d.error {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        egui::RichText::new(err).small(),
+                                    );
+                                } else if d.finished.is_none() {
+                                    let bar = match d.fraction() {
+                                        Some(f) => egui::ProgressBar::new(f)
+                                            .desired_width(240.0)
+                                            .text(format!("{:.0}%", f * 100.0)),
+                                        // No Content-Length: show motion, not a lie.
+                                        None => egui::ProgressBar::new(0.0)
+                                            .desired_width(240.0)
+                                            .animate(true)
+                                            .text(human_size(d.done as i64)),
+                                    };
+                                    ui.add(bar);
+                                }
+                            }
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match dl {
+                                Some(d) if d.finished.is_some() => {
+                                    let path = d.finished.clone().unwrap();
+                                    if ui.button("▶ Play").clicked() {
+                                        to_launch = Some((rom.clone(), path.clone()));
+                                    }
+                                    if ui.button("Folder").clicked() {
+                                        to_reveal = Some(
+                                            path.parent().map(Into::into).unwrap_or(path.clone()),
+                                        );
+                                    }
+                                }
+                                Some(d) if d.error.is_none() => {
+                                    if ui.button("Cancel").clicked() {
+                                        d.cancel.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                _ => {
+                                    if ui
+                                        .add_enabled(
+                                            !rom.missing_from_fs,
+                                            egui::Button::new("Download"),
+                                        )
+                                        .clicked()
+                                    {
+                                        to_download = Some(rom.clone());
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+
+            // Pagination
+            if self.total_roms > PAGE_SIZE {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let page = self.offset / PAGE_SIZE + 1;
+                    let pages = (self.total_roms + PAGE_SIZE - 1) / PAGE_SIZE;
+                    if ui
+                        .add_enabled(self.offset > 0, egui::Button::new("‹ Previous"))
+                        .clicked()
+                    {
+                        want_fetch = Some((self.offset - PAGE_SIZE).max(0));
+                    }
+                    ui.label(format!("Page {page} of {pages}"));
+                    if ui
+                        .add_enabled(
+                            self.offset + PAGE_SIZE < self.total_roms,
+                            egui::Button::new("Next ›"),
+                        )
+                        .clicked()
+                    {
+                        want_fetch = Some(self.offset + PAGE_SIZE);
+                    }
+                });
+            }
+        });
+
+        for rom in covers_needed {
+            self.request_cover(ctx, &rom);
+        }
+        if let Some(rom) = to_download {
+            self.start_download(ctx, &rom);
+        }
+        if let Some((rom, path)) = to_launch {
+            let result = match self.config.emulator_for(&rom.platform_slug) {
+                Some(cmd) => launch::launch(cmd, &path),
+                None => launch::open_with_os(&path),
+            };
+            self.status = Some(match result {
+                Ok(()) => format!("Launched {}", rom.title()),
+                Err(e) => format!("{e:#}"),
+            });
+        }
+        if let Some(path) = to_reveal {
+            if let Err(e) = launch::open_with_os(&path) {
+                self.status = Some(format!("{e:#}"));
+            }
+        }
+        if let Some(offset) = want_fetch {
+            self.fetch_roms(ctx, offset);
+        }
+    }
+
+    fn settings_screen(&mut self, root: &mut egui::Ui) {
+        let mut save_now = false;
+        egui::CentralPanel::default_margins().show(root, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("‹ Back").clicked() {
+                    self.screen = Screen::Library;
+                }
+                ui.heading("Settings");
+            });
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.label(egui::RichText::new("Downloads").strong());
+                // Resolved before the edit box borrows `config` mutably.
+                let default_dir = self.config.resolved_download_dir().display().to_string();
+                ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.download_dir)
+                            .hint_text(default_dir)
+                            .desired_width(420.0),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Games are saved into a sub-folder per platform. Leave blank for the default.",
+                    )
+                    .weak()
+                    .small(),
+                );
+
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Emulators").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "RustRomM doesn't emulate anything itself — it hands the file to an emulator you already have. \
+                         Use {rom} where the file path should go; if you leave it out, the path is added at the end.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Default:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.default_emulator)
+                            .hint_text("retroarch")
+                            .desired_width(420.0),
+                    );
+                });
+
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Per platform").small().strong());
+                for p in &self.platforms {
+                    let entry = self
+                        .config
+                        .emulators
+                        .entry(p.slug.clone())
+                        .or_default();
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(150.0, 20.0),
+                            egui::Label::new(p.display_name()).truncate(),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(entry)
+                                .hint_text("leave blank to use the default")
+                                .desired_width(380.0),
+                        );
+                    });
+                }
+
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Account").strong());
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} at {}",
+                        self.config.username,
+                        self.api.as_ref().map(Api::base_url).unwrap_or("—")
+                    ));
+                    if ui.button("Sign out").clicked() {
+                        self.config.password.clear();
+                        self.config.remember_password = false;
+                        self.api = None;
+                        self.roms.clear();
+                        self.platforms.clear();
+                        self.screen = Screen::Connect;
+                        save_now = true;
+                    }
+                });
+
+                ui.add_space(16.0);
+                if ui.button("Save settings").clicked() {
+                    save_now = true;
+                }
+                if let Ok(p) = Config::path() {
+                    ui.label(
+                        egui::RichText::new(format!("Config file: {}", p.display()))
+                            .weak()
+                            .small(),
+                    );
+                }
+            });
+        });
+
+        if save_now {
+            self.status = Some(match self.config.save() {
+                Ok(()) => "Settings saved.".to_string(),
+                Err(e) => format!("Could not save settings: {e:#}"),
+            });
+        }
+    }
+}

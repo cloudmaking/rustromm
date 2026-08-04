@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Never commit a real server address or credentials — settings live in the OS
+# config directory at runtime, not in the repo.
+config.json
+.env
+
+# OS noise
+.DS_Store
+Thumbs.db

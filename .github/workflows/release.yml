@@ -1,0 +1,107 @@
+name: Release
+
+# Builds binaries for all three desktop platforms. macOS binaries in particular
+# can only be produced on a macOS runner, so this workflow is how the
+# cross-platform claim is actually delivered.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux (x86_64)
+            target: x86_64-unknown-linux-gnu
+            binary: rustromm
+            archive: rustromm-linux-x86_64.tar.gz
+          - os: macos-latest
+            label: macOS (Apple Silicon)
+            target: aarch64-apple-darwin
+            binary: rustromm
+            archive: rustromm-macos-aarch64.tar.gz
+          - os: macos-13
+            label: macOS (Intel)
+            target: x86_64-apple-darwin
+            binary: rustromm
+            archive: rustromm-macos-x86_64.tar.gz
+          - os: windows-latest
+            label: Windows (x86_64)
+            target: x86_64-pc-windows-msvc
+            binary: rustromm.exe
+            archive: rustromm-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.archive }} ${{ matrix.binary }}
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path target/${{ matrix.target }}/release/${{ matrix.binary }} `
+            -DestinationPath ${{ matrix.archive }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rustromm-*.tar.gz
+            rustromm-*.zip
+          generate_release_notes: true
+          body: |
+            Desktop client for RomM.
+
+            **These binaries are unsigned.** macOS: right-click → Open.
+            Windows: More info → Run anyway.
