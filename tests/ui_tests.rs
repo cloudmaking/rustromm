@@ -264,3 +264,140 @@ fn settings_are_written_to_the_overridden_config_dir() {
     // remember_password defaults to false, so the password must not be stored.
     assert_eq!(saved["password"], "");
 }
+
+// ---------------------------------------------------------------- navigation
+//
+// Keyboard navigation is the substrate controller support is built on: both
+// funnel into the same `NavAction` enum, so exercising the keys here covers the
+// selection, paging and confirm logic a pad drives.
+//
+// What these tests do NOT cover: reading a real controller. That needs physical
+// hardware. The gamepad-to-action mapping is a pure function unit-tested in
+// `src/input.rs`; the polling layer between it and gilrs is not automatically
+// tested at all.
+
+/// Connect and wait for the library, ready to send key presses.
+fn library_harness() -> (Harness<'static, RustRomm>, MockServer) {
+    let server = working_server();
+    let mut h = harness_with(config_for(&server));
+    h.run();
+    let ctx = h.ctx.clone();
+    h.state_mut()
+        .pump_until(&ctx, Duration::from_secs(10), |a| a.on_library_screen());
+    h.run();
+    (h, server)
+}
+
+#[test]
+fn nothing_is_highlighted_until_you_press_a_key() {
+    let _guard = isolated_config();
+    let (h, _server) = library_harness();
+    assert_eq!(h.state().selected_index(), None);
+}
+
+#[test]
+fn arrow_down_highlights_the_first_game_then_walks_the_list() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(0));
+
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(1));
+}
+
+#[test]
+fn the_highlight_stops_at_the_end_rather_than_wrapping() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    // Only two games in the fixture; push well past the end.
+    for _ in 0..6 {
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+    }
+    assert_eq!(h.state().selected_index(), Some(1));
+
+    for _ in 0..6 {
+        h.key_press(egui::Key::ArrowUp);
+        h.run();
+    }
+    assert_eq!(h.state().selected_index(), Some(0));
+}
+
+#[test]
+fn arrow_up_from_nothing_selects_the_last_game() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    // Reaching backwards from no selection should land at the bottom, not
+    // jump to an arbitrary middle.
+    h.key_press(egui::Key::ArrowUp);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(1));
+}
+
+#[test]
+fn vim_keys_move_the_highlight_too() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    h.key_press(egui::Key::J);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(0));
+
+    h.key_press(egui::Key::J);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(1));
+
+    h.key_press(egui::Key::K);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(0));
+}
+
+#[test]
+fn escape_clears_the_highlight() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    assert!(h.state().selected_index().is_some());
+
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert_eq!(h.state().selected_index(), None);
+}
+
+#[test]
+fn confirm_on_a_missing_game_explains_itself_instead_of_failing_silently() {
+    let _guard = isolated_config();
+    let (mut h, _server) = library_harness();
+
+    // Second fixture game has missing_from_fs set.
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    assert_eq!(h.state().selected_index(), Some(1));
+
+    h.key_press(egui::Key::Enter);
+    h.run();
+
+    assert!(
+        h.query_by_label_contains("missing on the server").is_some(),
+        "pressing confirm on an unavailable game should say why"
+    );
+}
+
+#[test]
+fn no_controller_is_connected_in_a_headless_test_run() {
+    let _guard = isolated_config();
+    let (h, _server) = library_harness();
+    // Guards the hint text: CI must show the keyboard hints, not pad hints.
+    assert!(!h.state().gamepad_connected());
+    assert!(h.query_by_label_contains("Enter download/play").is_some());
+}

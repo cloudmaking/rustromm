@@ -29,14 +29,13 @@ is to say, properly.
 - Search across your collection
 - Download games, with progress, cancellation, and no half-written files left behind
 - Launch straight into your emulator, configurable per platform
+- **Drive the whole thing from a controller** — never touch the mouse
 - Remembers your server; optionally remembers your password
 
 ### What it doesn't do (yet)
 
 - Emulate anything itself — by design, see above
 - Save/state sync back to RomM
-- Gamepad navigation of RustRomM's own interface (you still use mouse and keyboard to
-  browse; the *game* is played on the pad)
 - Collections, achievements, multiplayer
 
 ## Install
@@ -83,6 +82,29 @@ sudo apt install libxkbcommon-dev libwayland-dev libx11-dev \
 2. Pick a platform on the left, or search.
 3. **Download** a game, then **Play**.
 
+### Controller and keyboard
+
+Plug in a pad and browse without reaching for the mouse — the point being that you can sit
+on the sofa and never touch a keyboard between picking a game and playing it.
+
+| Controller | Keyboard | |
+|---|---|---|
+| D-pad ↑↓ / left stick | `↑` `↓`, or `k` `j` | Move the highlight |
+| D-pad ← → | `←` `→` | Previous / next page |
+| **A** (bottom button) | `Enter` or `Space` | Download the game, or play it if already saved |
+| **B** (right button) | `Esc` | Clear the search, then the highlight |
+| LB / RB | `PgUp` / `PgDn` | Previous / next console |
+
+Button names follow whatever pad you have: A on Xbox, Cross on PlayStation, B on a Nintendo
+layout — it's always the bottom face button that confirms.
+
+The highlight is remembered per console, so going back to the Mega Drive returns you to the
+game you were looking at rather than the top of 726.
+
+Controller support is a Cargo feature, on by default. If `gilrs` won't build on your
+platform, `cargo build --no-default-features` gives you the app without it — keyboard
+navigation still works.
+
 ### Pointing it at an emulator
 
 **Settings → Emulators.** Set a default and, optionally, one per platform.
@@ -114,7 +136,8 @@ that bothers you and type it each launch.
 ## Development
 
 ```sh
-cargo test          # 40 tests, no server required
+cargo test                        # 57 offline tests; no server or controller needed
+cargo test --no-default-features  # same, with the gamepad feature off
 cargo clippy --all-targets
 cargo fmt
 ```
@@ -123,10 +146,15 @@ The suite has four layers:
 
 | Layer | What it covers |
 |---|---|
-| Unit tests (13) | URL normalising, emulator command parsing, config fallbacks, size formatting |
+| Unit tests (22) | URL normalising, emulator command parsing, config fallbacks, size formatting, key and controller button mapping, stick dead-zone and latching |
 | API tests (20) | The full HTTP stack against a mock RomM server — auth headers, query strings, streaming downloads, cancellation, error mapping |
-| UI tests (7) | The real widget tree, headless, via `egui_kittest` — connect flow, error states, library rendering |
-| Live tests (8) | Opt-in, against a real RomM instance |
+| UI tests (15) | The real widget tree, headless, via `egui_kittest` — connect flow, error states, library rendering, and keyboard navigation end to end |
+| Live tests (8) | Opt-in, against a real RomM instance — these self-skip, so `cargo test` reports 65 and runs 57 |
+
+**One thing is not automatically tested: reading an actual controller.** That needs physical
+hardware. The button-to-action mapping is a pure function with unit tests, and the keyboard
+path that shares all the same logic is covered end to end — but the layer that talks to
+`gilrs` is only verified by hand.
 
 Live tests are skipped unless you point them at a server:
 

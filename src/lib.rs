@@ -6,5 +6,6 @@
 pub mod api;
 pub mod app;
 pub mod config;
+pub mod input;
 pub mod launch;
 pub mod models;

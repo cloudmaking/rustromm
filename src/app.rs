@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::api::{Api, PAGE_SIZE};
 use crate::config::Config;
+use crate::input::{Gamepads, NavAction, key_to_action};
 use crate::launch;
 use crate::models::{Page, Platform, Rom, human_size};
 
@@ -83,6 +84,18 @@ pub struct RustRomm {
 
     downloads: HashMap<i64, Download>,
     status: Option<String>,
+
+    /// Highlighted row, as an index into `roms`. Drives keyboard and
+    /// controller navigation; `None` means nothing is highlighted yet.
+    selected: Option<usize>,
+    /// Scroll the highlighted row into view on the next frame. Set when the
+    /// selection moves by key or pad, so the list follows the highlight.
+    scroll_to_selected: bool,
+    /// Where the highlight was, per platform. Coming back to a console
+    /// returns you to the game you were on rather than the top of the list —
+    /// without this, controller browsing means re-scrolling every time.
+    remembered_selection: HashMap<Option<i64>, usize>,
+    gamepads: Gamepads,
 }
 
 impl RustRomm {
@@ -126,6 +139,10 @@ impl RustRomm {
             cover_requested: HashSet::new(),
             downloads: HashMap::new(),
             status: None,
+            selected: None,
+            scroll_to_selected: false,
+            remembered_selection: HashMap::new(),
+            gamepads: Gamepads::new(),
         };
 
         // Saved credentials mean we can go straight to the library.
@@ -203,6 +220,155 @@ impl RustRomm {
     /// Kick off a connection using the current config. Exposed for tests.
     pub fn connect(&mut self, ctx: &egui::Context) {
         self.start_connect(ctx);
+    }
+
+    /// Index of the highlighted game, if any. Exposed for tests.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// True when a controller is plugged in.
+    pub fn gamepad_connected(&self) -> bool {
+        self.gamepads.any_connected()
+    }
+
+    /// Navigation intents from the keyboard and any connected controller.
+    fn nav_actions(&mut self, ctx: &egui::Context) -> Vec<NavAction> {
+        let mut actions = self.gamepads.poll();
+
+        // Key navigation is suppressed while a text field has focus, or
+        // typing "j" into the search box would jump down the list instead of
+        // writing a letter.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing {
+            ctx.input(|i| {
+                for event in &i.events {
+                    // Held keys repeat, which is what you want when scrolling
+                    // a long list.
+                    if let egui::Event::Key {
+                        key, pressed: true, ..
+                    } = event
+                        && let Some(action) = key_to_action(*key)
+                    {
+                        actions.push(action);
+                    }
+                }
+            });
+        }
+        actions
+    }
+
+    /// Move the highlight, clamped to the current page.
+    fn move_selection(&mut self, delta: isize) {
+        if self.roms.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let last = (self.roms.len() - 1) as isize;
+        let next = match self.selected {
+            // First press highlights an end of the list rather than jumping
+            // to an arbitrary middle.
+            None if delta > 0 => 0,
+            None => last,
+            Some(current) => (current as isize + delta).clamp(0, last),
+        };
+        self.selected = Some(next as usize);
+        self.scroll_to_selected = true;
+        self.remember_selection();
+    }
+
+    fn remember_selection(&mut self) {
+        if let Some(index) = self.selected {
+            self.remembered_selection
+                .insert(self.selected_platform, index);
+        }
+    }
+
+    /// Step through the sidebar: "All games" followed by each platform.
+    /// Returns true when the selection actually changed.
+    fn cycle_platform(&mut self, delta: isize) -> bool {
+        let mut ids: Vec<Option<i64>> = vec![None];
+        ids.extend(self.platforms.iter().map(|p| Some(p.id)));
+
+        let current = ids
+            .iter()
+            .position(|id| *id == self.selected_platform)
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, ids.len() as isize - 1) as usize;
+
+        if ids[next] == self.selected_platform {
+            return false;
+        }
+        self.selected_platform = ids[next];
+        true
+    }
+}
+
+/// What a navigation pass decided to do, applied after the borrow ends.
+#[derive(Default)]
+struct NavOutcome {
+    fetch: Option<i64>,
+    download: Option<Rom>,
+    launch: Option<Rom>,
+}
+
+impl RustRomm {
+    /// Apply one frame's worth of navigation input.
+    fn handle_nav(&mut self, ctx: &egui::Context) -> NavOutcome {
+        let mut out = NavOutcome::default();
+
+        for action in self.nav_actions(ctx) {
+            match action {
+                NavAction::Up => self.move_selection(-1),
+                NavAction::Down => self.move_selection(1),
+                NavAction::PagePrev => {
+                    if self.offset > 0 {
+                        out.fetch = Some((self.offset - PAGE_SIZE).max(0));
+                    }
+                }
+                NavAction::PageNext => {
+                    if self.offset + PAGE_SIZE < self.total_roms {
+                        out.fetch = Some(self.offset + PAGE_SIZE);
+                    }
+                }
+                NavAction::PlatformPrev => {
+                    if self.cycle_platform(-1) {
+                        out.fetch = Some(0);
+                    }
+                }
+                NavAction::PlatformNext => {
+                    if self.cycle_platform(1) {
+                        out.fetch = Some(0);
+                    }
+                }
+                NavAction::Confirm => {
+                    let Some(rom) = self.selected.and_then(|i| self.roms.get(i)).cloned() else {
+                        continue;
+                    };
+                    match self.downloads.get(&rom.id) {
+                        // Already downloaded — confirm means play.
+                        Some(d) if d.finished.is_some() => out.launch = Some(rom),
+                        // Mid-download: ignore rather than starting a second one.
+                        Some(d) if d.error.is_none() => {}
+                        _ if rom.missing_from_fs => {
+                            self.status = Some(format!("{} is missing on the server", rom.title()));
+                        }
+                        _ => out.download = Some(rom),
+                    }
+                }
+                NavAction::Back => {
+                    // Escape backs out one step at a time: first the search,
+                    // then the highlight.
+                    if !self.search.is_empty() {
+                        self.search.clear();
+                        out.fetch = Some(0);
+                    } else {
+                        self.selected = None;
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn start_connect(&mut self, ctx: &egui::Context) {
@@ -360,6 +526,18 @@ impl RustRomm {
                     self.total_roms = page.total;
                     self.roms = page.items;
                     self.offset = offset;
+
+                    // Put the highlight back where it was on this platform, so
+                    // returning to a console doesn't dump you at the top of a
+                    // thousand-game list. Clamped, because the page may be
+                    // shorter than the one we remembered.
+                    self.selected = self
+                        .remembered_selection
+                        .get(&self.selected_platform)
+                        .copied()
+                        .filter(|_| !self.roms.is_empty())
+                        .map(|i| i.min(self.roms.len() - 1));
+                    self.scroll_to_selected = self.selected.is_some();
                 }
                 Msg::Failed(e) => {
                     self.loading = false;
@@ -475,13 +653,28 @@ impl RustRomm {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
 
+        // Keyboard and controller input is resolved before any widget is
+        // drawn, so a key press and a click take the same code path.
+        let nav = self.handle_nav(ctx);
+
         // Actions are collected during the UI pass and applied afterwards, so
         // nothing mutates `self` while a widget still borrows part of it.
-        let mut want_fetch: Option<i64> = None;
-        let mut to_download: Option<Rom> = None;
-        let mut to_launch: Option<(Rom, PathBuf)> = None;
+        let mut want_fetch: Option<i64> = nav.fetch;
+        let mut to_download: Option<Rom> = nav.download;
+        let mut to_launch: Option<(Rom, PathBuf)> = nav.launch.and_then(|rom| {
+            self.downloads
+                .get(&rom.id)
+                .and_then(|d| d.finished.clone())
+                .map(|path| (rom, path))
+        });
         let mut to_reveal: Option<PathBuf> = None;
         let mut covers_needed: Vec<Rom> = Vec::new();
+
+        // A connected pad produces no window events, so egui would otherwise
+        // stop repainting and the app would look frozen until the mouse moved.
+        if self.gamepads.any_connected() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
 
         egui::Panel::top("top").show(root, |ui| {
             ui.add_space(4.0);
@@ -567,6 +760,17 @@ impl RustRomm {
                         ui.label(egui::RichText::new(format!("{} games", self.total_roms)).weak());
                     }
                 }
+
+                // Control hints, right-aligned. The pad version appears only
+                // once one is plugged in — otherwise it's noise for mouse users.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let hint = if self.gamepads.any_connected() {
+                        "D-pad move · A download/play · B back · LB/RB console"
+                    } else {
+                        "↑↓ move · Enter download/play · Esc back · PgUp/PgDn console"
+                    };
+                    ui.label(egui::RichText::new(hint).weak().small());
+                });
             });
             ui.add_space(3.0);
         });
@@ -595,98 +799,121 @@ impl RustRomm {
                 return;
             }
 
+            let scroll_now = self.scroll_to_selected;
+            let selected = self.selected;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for rom in &self.roms {
+                for (index, rom) in self.roms.iter().enumerate() {
                     let dl = self.downloads.get(&rom.id);
-                    ui.horizontal(|ui| {
-                        // Cover
-                        let size = egui::vec2(48.0, 64.0);
-                        match self.covers.get(&rom.id) {
-                            Some(Some(bytes)) => {
-                                ui.add_sized(
-                                    size,
-                                    egui::Image::from_bytes(
-                                        format!("bytes://cover-{}", rom.id),
-                                        bytes.clone(),
-                                    )
-                                    .maintain_aspect_ratio(true),
-                                );
-                            }
-                            Some(None) => {
-                                ui.allocate_space(size);
-                            }
-                            None => {
-                                covers_needed.push(rom.clone());
-                                ui.allocate_space(size);
-                            }
-                        }
+                    let is_selected = selected == Some(index);
 
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(rom.title()).strong());
-                            let mut meta = format!(
-                                "{} · {}",
-                                rom.platform_display_name,
-                                human_size(rom.fs_size_bytes)
-                            );
-                            if rom.missing_from_fs {
-                                meta.push_str(" · missing on server");
-                            }
-                            ui.label(egui::RichText::new(meta).weak().small());
+                    // Highlight has to read from across a room, not just be a
+                    // subtle outline — this is the cue you steer by on a pad.
+                    let mut frame = egui::Frame::default().inner_margin(4.0);
+                    if is_selected {
+                        frame = frame
+                            .fill(ui.visuals().selection.bg_fill.gamma_multiply(0.45))
+                            .corner_radius(4.0);
+                    }
 
-                            if let Some(d) = dl {
-                                if let Some(err) = &d.error {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(220, 90, 90),
-                                        egui::RichText::new(err).small(),
-                                    );
-                                } else if d.finished.is_none() {
-                                    let bar = match d.fraction() {
-                                        Some(f) => egui::ProgressBar::new(f)
-                                            .desired_width(240.0)
-                                            .text(format!("{:.0}%", f * 100.0)),
-                                        // No Content-Length: show motion, not a lie.
-                                        None => egui::ProgressBar::new(0.0)
-                                            .desired_width(240.0)
-                                            .animate(true)
-                                            .text(human_size(d.done as i64)),
-                                    };
-                                    ui.add(bar);
-                                }
-                            }
-                        });
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            match dl {
-                                Some(d) if d.finished.is_some() => {
-                                    let path = d.finished.clone().unwrap();
-                                    if ui.button("▶ Play").clicked() {
-                                        to_launch = Some((rom.clone(), path.clone()));
-                                    }
-                                    if ui.button("Folder").clicked() {
-                                        to_reveal = Some(
-                                            path.parent().map(Into::into).unwrap_or(path.clone()),
-                                        );
-                                    }
-                                }
-                                Some(d) if d.error.is_none() => {
-                                    if ui.button("Cancel").clicked() {
-                                        d.cancel.store(true, Ordering::Relaxed);
-                                    }
-                                }
-                                _ => {
-                                    if ui
-                                        .add_enabled(
-                                            !rom.missing_from_fs,
-                                            egui::Button::new("Download"),
+                    let row = frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Cover
+                            let size = egui::vec2(48.0, 64.0);
+                            match self.covers.get(&rom.id) {
+                                Some(Some(bytes)) => {
+                                    ui.add_sized(
+                                        size,
+                                        egui::Image::from_bytes(
+                                            format!("bytes://cover-{}", rom.id),
+                                            bytes.clone(),
                                         )
-                                        .clicked()
-                                    {
-                                        to_download = Some(rom.clone());
-                                    }
+                                        .maintain_aspect_ratio(true),
+                                    );
+                                }
+                                Some(None) => {
+                                    ui.allocate_space(size);
+                                }
+                                None => {
+                                    covers_needed.push(rom.clone());
+                                    ui.allocate_space(size);
                                 }
                             }
+
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(rom.title()).strong());
+                                let mut meta = format!(
+                                    "{} · {}",
+                                    rom.platform_display_name,
+                                    human_size(rom.fs_size_bytes)
+                                );
+                                if rom.missing_from_fs {
+                                    meta.push_str(" · missing on server");
+                                }
+                                ui.label(egui::RichText::new(meta).weak().small());
+
+                                if let Some(d) = dl {
+                                    if let Some(err) = &d.error {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            egui::RichText::new(err).small(),
+                                        );
+                                    } else if d.finished.is_none() {
+                                        let bar = match d.fraction() {
+                                            Some(f) => egui::ProgressBar::new(f)
+                                                .desired_width(240.0)
+                                                .text(format!("{:.0}%", f * 100.0)),
+                                            // No Content-Length: show motion, not a lie.
+                                            None => egui::ProgressBar::new(0.0)
+                                                .desired_width(240.0)
+                                                .animate(true)
+                                                .text(human_size(d.done as i64)),
+                                        };
+                                        ui.add(bar);
+                                    }
+                                }
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| match dl {
+                                    Some(d) if d.finished.is_some() => {
+                                        let path = d.finished.clone().unwrap();
+                                        if ui.button("▶ Play").clicked() {
+                                            to_launch = Some((rom.clone(), path.clone()));
+                                        }
+                                        if ui.button("Folder").clicked() {
+                                            to_reveal = Some(
+                                                path.parent()
+                                                    .map(Into::into)
+                                                    .unwrap_or(path.clone()),
+                                            );
+                                        }
+                                    }
+                                    Some(d) if d.error.is_none() => {
+                                        if ui.button("Cancel").clicked() {
+                                            d.cancel.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                    _ => {
+                                        if ui
+                                            .add_enabled(
+                                                !rom.missing_from_fs,
+                                                egui::Button::new("Download"),
+                                            )
+                                            .clicked()
+                                        {
+                                            to_download = Some(rom.clone());
+                                        }
+                                    }
+                                },
+                            );
                         });
                     });
+
+                    // Keep the highlight on screen when it moves by key or pad.
+                    if is_selected && scroll_now {
+                        row.response.scroll_to_me(Some(egui::Align::Center));
+                    }
                     ui.separator();
                 }
             });
@@ -716,6 +943,9 @@ impl RustRomm {
                 });
             }
         });
+
+        // The scroll request is honoured for exactly one frame.
+        self.scroll_to_selected = false;
 
         for rom in covers_needed {
             self.request_cover(ctx, &rom);

@@ -82,10 +82,18 @@ The transferable ideas, none of which need Android:
    a room.
 4. **A confirms, B goes back.** Consistently, everywhere.
 
-RustRomM does not do gamepad UI navigation yet. egui supports keyboard focus natively;
-adding a pad would mean [`gilrs`](https://crates.io/crates/gilrs) translating gamepad events
-into `egui::Event::Key`. That is the natural v2 feature, and it's what would make RustRomM
-usable on a TV.
+**Implemented in v0.2.0** via [`gilrs`](https://crates.io/crates/gilrs), in `src/input.rs`.
+Keyboard and controller both produce a single `NavAction` enum, so there is one code path
+and the logic is testable without hardware. Points 1–4 above are all honoured, including
+per-console focus restoration.
+
+Two things that bit during implementation and are worth remembering:
+
+- **egui stops repainting when nothing happens.** A controller produces no window events, so
+  without an explicit `request_repaint_after` while a pad is connected, the app appears
+  frozen until you nudge the mouse. This is the bug you will hit first.
+- **Suppress key navigation while a text field has focus**, or typing "j" into the search box
+  scrolls the list instead of writing a letter.
 
 ## Deliberately not ported
 
