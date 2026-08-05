@@ -21,17 +21,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every target is built on a runner of its own architecture — no
+        # cross-compiling, so each binary is exercised on the hardware it
+        # ships for.
         include:
           - os: ubuntu-latest
             label: Linux (x86_64)
             target: x86_64-unknown-linux-gnu
             binary: rustromm
             archive: rustromm-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            label: Linux (arm64)
+            target: aarch64-unknown-linux-gnu
+            binary: rustromm
+            archive: rustromm-linux-arm64.tar.gz
           - os: macos-latest
             label: macOS (Apple Silicon)
             target: aarch64-apple-darwin
             binary: rustromm
-            archive: rustromm-macos-aarch64.tar.gz
+            archive: rustromm-macos-arm64.tar.gz
           - os: macos-13
             label: macOS (Intel)
             target: x86_64-apple-darwin
@@ -42,6 +50,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: rustromm.exe
             archive: rustromm-windows-x86_64.zip
+          - os: windows-11-arm
+            label: Windows (arm64)
+            target: aarch64-pc-windows-msvc
+            binary: rustromm.exe
+            archive: rustromm-windows-arm64.zip
 
     steps:
       - uses: actions/checkout@v4

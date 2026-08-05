@@ -6,6 +6,8 @@ and Windows.
 
 > **Unofficial.** Not affiliated with or endorsed by the RomM project.
 
+![RustRomM browsing a RomM library](docs/images/rustromm.png)
+
 ---
 
 ## Why
@@ -40,7 +42,16 @@ is to say, properly.
 ## Install
 
 Download a build for your platform from
-[Releases](https://github.com/cloudmaking/rustromm/releases).
+[Releases](https://github.com/cloudmaking/rustromm/releases). Both x86_64 and arm64 are
+built for all three operating systems:
+
+| | x86_64 | arm64 |
+|---|---|---|
+| Linux | `rustromm-linux-x86_64.tar.gz` | `rustromm-linux-arm64.tar.gz` |
+| macOS | `rustromm-macos-x86_64.tar.gz` (Intel) | `rustromm-macos-arm64.tar.gz` (M-series) |
+| Windows | `rustromm-windows-x86_64.zip` | `rustromm-windows-arm64.zip` |
+
+Each is compiled and tested on a runner of that architecture — nothing is cross-compiled.
 
 macOS and Windows builds are unsigned, so the OS will warn on first launch — on macOS,
 right-click the app and choose Open; on Windows, More info → Run anyway.
