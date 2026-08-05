@@ -223,6 +223,19 @@ cargo test --test live_tests -- --nocapture
 These are the ones that catch RomM changing its API shape, which the mocks cannot see by
 construction. Verified against **RomM 5.1.0**.
 
+## Contributing
+
+Very welcome — this is one person's side project and there's a lot of obvious
+room to improve it. **You don't need to write Rust to help:** if something
+misbehaves, hit **Logs → Copy all** and paste that into an issue. It carries the
+version, your OS and architecture, and what the app actually did.
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) lists good first issues — save/state sync,
+device pairing instead of a stored password, wider emulator detection, a
+Homebrew tap, a grid view — and sets out the one architectural question worth
+settling before anyone writes much code: whether to keep launching external
+emulators or embed software-rendered libretro cores for the 2D consoles.
+
 ## Credits
 
 - [RomM](https://github.com/rommapp/romm) — the server this talks to (AGPL-3.0)

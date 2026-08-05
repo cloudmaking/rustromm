@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.0 — 2026-08-05
+
+A **Logs** tab, so problems can be reported without opening a terminal:
+Logs → Copy all produces a report headed by version, OS and architecture.
+
+Fixed a launch bug that reported success on failure. Pressing Play with no
+emulator configured fell back to the system opener — but no OS has a handler for
+`.gbc` or `.smc`, and on macOS `open` fails *after* spawning successfully, so
+the app said "Launched Tetris DX" while the real error went to a stderr nobody
+was reading. It now waits for the exit status, and with no emulator configured
+it says so and jumps to Settings with the right platform highlighted.
+
+First-run setup no longer means typing paths by hand:
+
+- **Browse…** buttons for the download folder and every emulator field, via a
+  native file dialog. Typing a path was especially miserable on macOS, where the
+  binary hides inside a `.app` bundle.
+- **Detect** finds RetroArch, PPSSPP, Dolphin and friends in the usual install
+  locations and on `PATH`.
+
+Also: the project is now open for contributions — see `CONTRIBUTING.md`.
+
+Tests: 69, up from 65. The new logging tests initially raced on the shared
+buffer and are now serialised.
+
 ## v0.2.0 — 2026-08-05
 
 Controller navigation. The project exists because RomM's browser player handles

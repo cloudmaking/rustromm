@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: RomM itself
+    url: https://github.com/rommapp/romm
+    about: Problems with the server rather than this client belong upstream.
+  - name: Argosy (Android client)
+    url: https://github.com/rommapp/argosy-launcher
+    about: The official Android client, if you want RomM on a phone.
