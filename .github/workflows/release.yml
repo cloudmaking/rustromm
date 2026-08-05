@@ -72,7 +72,11 @@ jobs:
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          # Third-party repos preinstalled on the runner image (azure-cli and
+          # friends) intermittently return 403, which fails apt-get update and
+          # takes the whole job with it. Everything we need comes from the
+          # Ubuntu archives, so tolerate a partial refresh.
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev \
             libxcursor-dev libxrandr-dev libxi-dev \
