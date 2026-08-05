@@ -151,6 +151,10 @@ The suite has four layers:
 | UI tests (15) | The real widget tree, headless, via `egui_kittest` — connect flow, error states, library rendering, and keyboard navigation end to end |
 | Live tests (8) | Opt-in, against a real RomM instance — these self-skip, so `cargo test` reports 65 and runs 57 |
 
+A checklist of what automation cannot reach — controller hardware, emulator
+launching, how things actually look — is in
+[`docs/manual-testing.md`](docs/manual-testing.md).
+
 **One thing is not automatically tested: reading an actual controller.** That needs physical
 hardware. The button-to-action mapping is a pure function with unit tests, and the keyboard
 path that shares all the same logic is covered end to end — but the layer that talks to
