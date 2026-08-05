@@ -51,7 +51,10 @@ built for all three operating systems:
 | macOS | `rustromm-macos-x86_64.tar.gz` (Intel) | `rustromm-macos-arm64.tar.gz` (M-series) |
 | Windows | `rustromm-windows-x86_64.zip` | `rustromm-windows-arm64.zip` |
 
-Each is compiled and tested on a runner of that architecture — nothing is cross-compiled.
+Every build except Intel macOS is compiled *and* runs the test suite on a runner of its own
+architecture — including both arm64 targets. The Intel macOS binary is cross-compiled from
+an Apple Silicon runner, since GitHub is retiring its Intel macOS image, so it is the one
+build not covered by a test run.
 
 macOS and Windows builds are unsigned, so the OS will warn on first launch — on macOS,
 right-click the app and choose Open; on Windows, More info → Run anyway.

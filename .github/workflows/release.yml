@@ -21,9 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every target is built on a runner of its own architecture — no
-        # cross-compiling, so each binary is exercised on the hardware it
-        # ships for.
+        # Every target is built on a runner of its own architecture, with one
+        # exception: the Intel macOS binary is cross-compiled from the Apple
+        # Silicon runner. The macos-13 image is being retired and its jobs sit
+        # queued forever, which blocked the entire release. Apple's toolchain
+        # ships both darwin targets, so cross-compiling is well supported here.
         include:
           - os: ubuntu-latest
             label: Linux (x86_64)
@@ -40,7 +42,7 @@ jobs:
             target: aarch64-apple-darwin
             binary: rustromm
             archive: rustromm-macos-arm64.tar.gz
-          - os: macos-13
+          - os: macos-latest
             label: macOS (Intel)
             target: x86_64-apple-darwin
             binary: rustromm
