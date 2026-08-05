@@ -55,43 +55,26 @@ architecture — including both arm64 targets. The Intel macOS binary is cross-c
 an Apple Silicon runner, since GitHub is retiring its Intel macOS image, so it is the one
 build not covered by a test run.
 
-> ### ⚠️ Your OS will block the first launch
+> ### ⚠️ Your OS will block the first launch — this is expected
 >
-> These builds are **unsigned**, so macOS and Windows both refuse to run them until you say
-> otherwise. This is expected, it is not a sign anything is wrong, and the fix is one
-> command. See below — and [why it happens](#why-does-my-os-warn-about-this) if you'd
-> rather know than trust me.
+> These builds aren't signed, so macOS and Windows refuse to run them until you allow it.
+> Nothing is wrong; nobody has paid Apple or Microsoft to vouch for the binary.
 
-### First launch: the OS will block it
+**macOS** — you'll see *"Apple could not verify 'rustromm' is free of malware."*
 
-These builds are **unsigned and un-notarized**, and each release is a plain executable in an
-archive rather than an installer. Both operating systems will object.
+1. Extract the archive and try to run it once. It gets blocked.
+2. Open **System Settings → Privacy & Security**.
+3. Scroll to the message about `rustromm` and click **Open Anyway**.
+4. Confirm. It starts, and won't ask again.
 
-**macOS** — you'll get *"Apple could not verify 'rustromm' is free of malware."* Extract and
-clear the quarantine flag your browser attached on download:
+Ignore any advice to right-click and choose Open — Apple removed that in macOS Sequoia, and
+it never applied to a bare executable like this anyway. If you prefer the terminal,
+`xattr -c rustromm && chmod +x rustromm && ./rustromm` does the same job in one line.
 
-```sh
-cd ~/Downloads
-tar -xzf rustromm-macos-arm64.tar.gz     # or -x86_64 on an Intel Mac
-xattr -c rustromm
-chmod +x rustromm
-./rustromm
-```
+**Windows** — SmartScreen shows *"Windows protected your PC"*. Click **More info**, then
+**Run anyway**.
 
-Do **not** follow the usual "right-click and choose Open" advice — Apple removed that
-bypass in macOS Sequoia, and it never applied to a bare executable like this one anyway.
-If you'd rather not use the terminal, run it once, let it be blocked, then go to
-**System Settings → Privacy & Security** and click **Open Anyway** next to the warning.
-
-**Windows** — SmartScreen will show *"Windows protected your PC"*. Click **More info**, then
-**Run anyway**. If the file is blocked outright, right-click the zip → Properties → tick
-**Unblock** before extracting.
-
-**Linux** — no gatekeeping, just make it executable:
-
-```sh
-tar -xzf rustromm-linux-x86_64.tar.gz && chmod +x rustromm && ./rustromm
-```
+**Linux** — nothing to bypass: `chmod +x rustromm && ./rustromm`
 
 ### Why does my OS warn about this?
 

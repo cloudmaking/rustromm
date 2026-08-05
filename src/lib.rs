@@ -8,4 +8,5 @@ pub mod app;
 pub mod config;
 pub mod input;
 pub mod launch;
+pub mod logging;
 pub mod models;

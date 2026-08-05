@@ -14,6 +14,7 @@ use crate::api::{Api, PAGE_SIZE};
 use crate::config::Config;
 use crate::input::{Gamepads, NavAction, key_to_action};
 use crate::launch;
+use crate::logging;
 use crate::models::{Page, Platform, Rom, human_size};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -21,6 +22,7 @@ enum Screen {
     Connect,
     Library,
     Settings,
+    Logs,
 }
 
 /// Results coming back from worker threads.
@@ -96,6 +98,11 @@ pub struct RustRomm {
     /// without this, controller browsing means re-scrolling every time.
     remembered_selection: HashMap<Option<i64>, usize>,
     gamepads: Gamepads,
+
+    /// Platform slug whose emulator field should be highlighted in Settings.
+    /// Set when a launch is attempted with nothing configured, so the user
+    /// lands on the exact field that needs filling in rather than a wall of them.
+    needs_emulator_for: Option<String>,
 }
 
 impl RustRomm {
@@ -143,6 +150,7 @@ impl RustRomm {
             scroll_to_selected: false,
             remembered_selection: HashMap::new(),
             gamepads: Gamepads::new(),
+            needs_emulator_for: None,
         };
 
         // Saved credentials mean we can go straight to the library.
@@ -214,6 +222,7 @@ impl RustRomm {
             Screen::Connect => self.connect_screen(ui),
             Screen::Library => self.library_screen(ui),
             Screen::Settings => self.settings_screen(ui),
+            Screen::Logs => self.logs_screen(ui),
         }
     }
 
@@ -505,6 +514,7 @@ impl RustRomm {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Connected(api, version) => {
+                    logging::info(format!("connected to RomM {version} at {}", api.base_url()));
                     self.connecting = false;
                     self.api = Some(api);
                     self.server_version = Some(version);
@@ -517,6 +527,7 @@ impl RustRomm {
                     self.fetch_roms(ctx, 0);
                 }
                 Msg::ConnectFailed(e) => {
+                    logging::error(format!("connect failed: {e}"));
                     self.connecting = false;
                     self.connect_error = Some(e);
                 }
@@ -540,6 +551,7 @@ impl RustRomm {
                     self.scroll_to_selected = self.selected.is_some();
                 }
                 Msg::Failed(e) => {
+                    logging::error(format!("request failed: {e}"));
                     self.loading = false;
                     self.error = Some(e);
                 }
@@ -553,12 +565,14 @@ impl RustRomm {
                     }
                 }
                 Msg::Downloaded(id, path) => {
+                    logging::info(format!("download complete: {}", path.display()));
                     if let Some(d) = self.downloads.get_mut(&id) {
                         d.finished = Some(path.clone());
                     }
                     self.status = Some(format!("Saved to {}", path.display()));
                 }
                 Msg::DownloadFailed(id, e) => {
+                    logging::error(format!("download {id} failed: {e}"));
                     if let Some(d) = self.downloads.get_mut(&id) {
                         d.error = Some(e.clone());
                     }
@@ -701,6 +715,9 @@ impl RustRomm {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.screen = Screen::Settings;
+                    }
+                    if ui.button("Logs").clicked() {
+                        self.screen = Screen::Logs;
                     }
                     if let Some(v) = &self.server_version {
                         ui.label(egui::RichText::new(format!("RomM {v}")).weak());
@@ -954,14 +971,41 @@ impl RustRomm {
             self.start_download(ctx, &rom);
         }
         if let Some((rom, path)) = to_launch {
-            let result = match self.config.emulator_for(&rom.platform_slug) {
-                Some(cmd) => launch::launch(cmd, &path),
-                None => launch::open_with_os(&path),
-            };
-            self.status = Some(match result {
-                Ok(()) => format!("Launched {}", rom.title()),
-                Err(e) => format!("{e:#}"),
-            });
+            match self.config.emulator_for(&rom.platform_slug) {
+                Some(cmd) => {
+                    logging::info(format!(
+                        "launching {} via `{cmd}` -> {}",
+                        rom.title(),
+                        path.display()
+                    ));
+                    self.status = Some(match launch::launch(cmd, &path) {
+                        Ok(()) => format!("Launched {}", rom.title()),
+                        Err(e) => {
+                            logging::error(format!("launch failed: {e:#}"));
+                            format!("{e:#}")
+                        }
+                    });
+                }
+                None => {
+                    // Deliberately NOT falling back to the system opener. No OS
+                    // ships a handler for .gbc or .smc, so it fails for exactly
+                    // the case it would be reached in — and on macOS it fails
+                    // *after* spawning, which used to be reported as success.
+                    // Send them somewhere they can fix it instead.
+                    self.status = Some(format!(
+                        "No emulator set for {}. Pick one below — {} is already downloaded.",
+                        rom.platform_display_name,
+                        path.display()
+                    ));
+                    logging::warn(format!(
+                        "no emulator configured for platform '{}' — not falling back to the \
+                         system opener, which has no handler for these file types",
+                        rom.platform_slug
+                    ));
+                    self.needs_emulator_for = Some(rom.platform_slug.clone());
+                    self.screen = Screen::Settings;
+                }
+            }
         }
         if let Some(path) = to_reveal {
             if let Err(e) = launch::open_with_os(&path) {
@@ -993,8 +1037,14 @@ impl RustRomm {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.download_dir)
                             .hint_text(default_dir)
-                            .desired_width(420.0),
+                            .desired_width(340.0),
                     );
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.config.download_dir = dir.display().to_string();
+                        save_now = true;
+                    }
                 });
                 ui.label(
                     egui::RichText::new(
@@ -1020,8 +1070,32 @@ impl RustRomm {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.default_emulator)
                             .hint_text("retroarch")
-                            .desired_width(420.0),
+                            .desired_width(280.0),
                     );
+                    if ui.button("Browse…").clicked()
+                        && let Some(file) = rfd::FileDialog::new().pick_file()
+                    {
+                        self.config.default_emulator = file.display().to_string();
+                        save_now = true;
+                    }
+                    if ui.button("Detect").clicked() {
+                        let found = launch::detect_emulators();
+                        logging::info(format!("emulator scan found {} candidate(s)", found.len()));
+                        match found.first() {
+                            Some((label, command)) => {
+                                self.config.default_emulator = command.clone();
+                                self.status = Some(format!("Found {label}."));
+                                save_now = true;
+                            }
+                            None => {
+                                self.status = Some(
+                                    "No emulator found in the usual places — use Browse to \
+                                     point at one."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
                 });
 
                 ui.add_space(10.0);
@@ -1032,16 +1106,28 @@ impl RustRomm {
                         .emulators
                         .entry(p.slug.clone())
                         .or_default();
+                    let wanted = self.needs_emulator_for.as_deref() == Some(p.slug.as_str());
                     ui.horizontal(|ui| {
-                        ui.add_sized(
-                            egui::vec2(150.0, 20.0),
-                            egui::Label::new(p.display_name()).truncate(),
-                        );
-                        ui.add(
+                        let mut label = egui::RichText::new(p.display_name());
+                        if wanted {
+                            label = label.strong().color(egui::Color32::from_rgb(220, 170, 70));
+                        }
+                        ui.add_sized(egui::vec2(150.0, 20.0), egui::Label::new(label).truncate());
+                        let field = ui.add(
                             egui::TextEdit::singleline(entry)
                                 .hint_text("leave blank to use the default")
-                                .desired_width(380.0),
+                                .desired_width(300.0),
                         );
+                        // Land the cursor on the field that sent them here.
+                        if wanted && !field.has_focus() {
+                            field.request_focus();
+                        }
+                        if ui.button("Browse…").clicked()
+                            && let Some(file) = rfd::FileDialog::new().pick_file()
+                        {
+                            *entry = file.display().to_string();
+                            save_now = true;
+                        }
                     });
                 }
 
@@ -1080,9 +1166,85 @@ impl RustRomm {
 
         if save_now {
             self.status = Some(match self.config.save() {
-                Ok(()) => "Settings saved.".to_string(),
-                Err(e) => format!("Could not save settings: {e:#}"),
+                Ok(()) => {
+                    logging::info("settings saved");
+                    "Settings saved.".to_string()
+                }
+                Err(e) => {
+                    logging::error(format!("could not save settings: {e:#}"));
+                    format!("Could not save settings: {e:#}")
+                }
             });
         }
+    }
+
+    /// Everything the app has recorded this session, with a copy button.
+    ///
+    /// The point is that a user can hand over a diagnosis without opening a
+    /// terminal. Failures that only reach stderr may as well not exist.
+    fn logs_screen(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        egui::CentralPanel::default_margins().show(root, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Back").clicked() {
+                    self.screen = Screen::Library;
+                }
+                ui.heading("Logs");
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Clear").clicked() {
+                        logging::clear();
+                    }
+                    if ui.button("Copy all").clicked() {
+                        ctx.copy_text(logging::report());
+                        self.status = Some("Log copied to the clipboard.".to_string());
+                    }
+                });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Copy this and send it over if something misbehaves. It records what the \
+                     app did, not what is in your library — no game data, no password.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.separator();
+
+            let entries = logging::entries();
+            if entries.is_empty() {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| ui.label("Nothing logged yet."));
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                // Newest entries matter most, and they are at the bottom.
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for entry in entries {
+                        let colour = match entry.level {
+                            logging::Level::Info => ui.visuals().weak_text_color(),
+                            logging::Level::Warn => egui::Color32::from_rgb(220, 170, 70),
+                            logging::Level::Error => egui::Color32::from_rgb(220, 90, 90),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:7.2}s", entry.at))
+                                    .monospace()
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(&entry.message)
+                                    .monospace()
+                                    .small()
+                                    .color(colour),
+                            );
+                        });
+                    }
+                });
+        });
     }
 }
