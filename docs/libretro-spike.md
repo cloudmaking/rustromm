@@ -138,3 +138,58 @@ cargo run --release -- gambatte_libretro.so "some-game.gb"
 The spike source is not part of the shipped crate; it exists to be re-run when a claim
 here is doubted. Every number above came from it, on one machine, in one sitting — they
 are indicative, not a benchmark suite.
+
+---
+
+## Update: the two unknowns are settled, by CI rather than by argument
+
+The research phase named these the risks that would sink the rewrite. Both were
+answerable with one CI run each, so they were answered before anything was built
+on top of them.
+
+### Windows on ARM can load an x64 core under emulation ✅
+
+The buildbot has no arm64 Windows cores, and a native ARM64 process cannot
+`LoadLibrary` an x64 DLL — so the plan was to ship the x86_64 build to Windows on
+ARM and let Prism emulate the whole app. Nobody had verified that an *emulated*
+x64 process could then load an x64 core.
+
+It can. The `windows-arm-under-emulation` CI job builds for
+`x86_64-pc-windows-msvc` on a `windows-11-arm` runner — exactly what a
+Windows-on-ARM user downloads — and the full core suite passes. That target has a
+path, and it is the same binary everyone else on Windows gets.
+
+### macOS loads an ad-hoc-signed third-party core ✅
+
+The buildbot's arm64 dylibs are ad-hoc signed with no CMS blob and are not
+notarized; the x86_64 ones carry no signature at all. Library validation could
+have refused them outright.
+
+It does not. `Test (macOS arm64)` downloads and `dlopen`s a buildbot core and
+passes.
+
+**One caveat worth keeping honest:** this proves it for an *unsigned* binary,
+which is what RustRomM ships today. Library validation is imposed by the Hardened
+Runtime, so if the app is ever signed and notarized it will need the
+`com.apple.security.cs.disable-library-validation` entitlement, or this stops
+working. Anyone setting up signing should read this paragraph first.
+
+### And one that changed the design
+
+Handing a core the log interface is not optional, and doing it in pure Rust does
+not work. `c_variadic` is still unstable on Rust 1.97, so a non-variadic
+stand-in receives the format string with no arguments substituted. Measured
+against Gambatte, that loses **100%** of the content — every message it emits is
+`log_cb(level, "[Gambatte] %s\n", text)`, so the string we would capture is
+literally `[Gambatte] %s`. Cores announce missing BIOS files the same way.
+
+The fix is nineteen lines of C doing the `vsnprintf`, in
+`src/libretro/shim/log_shim.c`. Before and after, same core, same ROM:
+
+```
+  [core INFO] [Gambatte] %s   (arguments not expanded)     <- pure Rust
+  [core INFO] [Gambatte] MBC1 ROM loaded.                  <- via the shim
+  [core INFO] [Gambatte] Got internal game name: TETRIS2.
+```
+
+It compiles on all six targets in CI.

@@ -52,7 +52,34 @@ struct Shared {
     /// because the core keeps the pointer indefinitely.
     system_dir: Mutex<Option<&'static CStr>>,
     save_dir: Mutex<Option<&'static CStr>>,
+    /// Everything the core told us about itself, kept for the Logs tab. The
+    /// interesting failures happen on someone else's machine, and "it didn't
+    /// work" is unanswerable without this.
+    diagnostics: Mutex<Diagnostics>,
 }
+
+/// What the core said, and what we refused to let it do.
+#[derive(Debug, Clone, Default)]
+pub struct Diagnostics {
+    /// Messages the core emitted through the log interface, newest last.
+    /// Bounded: a chatty core at 60 fps would otherwise flood the app's shared
+    /// ring buffer within seconds and push out everything else.
+    pub core_log: Vec<String>,
+    /// Environment commands we declined, by number, in order and deduplicated.
+    ///
+    /// Worth its own field because it is often the whole explanation. A refused
+    /// 14 (`SET_HW_RENDER`) means the core wanted a GL context and gave up —
+    /// which presents to the user as a black screen and to us, without this, as
+    /// nothing at all.
+    pub refused_commands: Vec<u32>,
+    /// Raw value from `SET_SERIALIZATION_QUIRKS`, or `None` if never set.
+    pub serialization_quirks: Option<u64>,
+    /// Pixel format the core actually chose, once it has.
+    pub pixel_format: Option<&'static str>,
+}
+
+/// Enough to diagnose a session, small enough to paste into a message.
+const MAX_CORE_LOG: usize = 300;
 
 impl Shared {
     fn new() -> Self {
@@ -65,6 +92,7 @@ impl Shared {
             wants_shutdown: AtomicBool::new(false),
             system_dir: Mutex::new(None),
             save_dir: Mutex::new(None),
+            diagnostics: Mutex::new(Diagnostics::default()),
         }
     }
 
@@ -80,6 +108,7 @@ impl Shared {
             .store(sys::RETRO_PIXEL_FORMAT_0RGB1555, Ordering::SeqCst);
         self.frames_seen.store(0, Ordering::SeqCst);
         self.wants_shutdown.store(false, Ordering::SeqCst);
+        *lock(&self.diagnostics) = Diagnostics::default();
     }
 }
 
@@ -110,9 +139,118 @@ fn leak_cstr(path: &Path) -> Option<&'static CStr> {
     Some(Box::leak(s.into_boxed_c_str()))
 }
 
+unsafe extern "C" {
+    /// The C shim that does the `vsnprintf` stable Rust cannot.
+    ///
+    /// This is the pointer handed to cores. It formats the message and calls
+    /// `rustromm_core_log_line` below with the finished string. See
+    /// `src/libretro/shim/log_shim.c` for why the C is unavoidable.
+    fn rustromm_log_shim(level: c_uint, fmt: *const c_char, ...);
+}
+
+/// Called by the shim with an already-formatted message.
+///
+/// `#[unsafe(no_mangle)]` because C resolves it by name at link time.
+#[unsafe(no_mangle)]
+extern "C" fn rustromm_core_log_line(level: c_uint, text: *const c_char) {
+    if text.is_null() {
+        return;
+    }
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    record_core_log(level, text.trim_end_matches(['\n', '\r']));
+}
+
+fn record_core_log(level: c_uint, text: &str) {
+    let tag = match level {
+        sys::RETRO_LOG_ERROR => "ERR ",
+        sys::RETRO_LOG_WARN => "WARN",
+        sys::RETRO_LOG_DEBUG => "DBG ",
+        _ => "INFO",
+    };
+    let line = format!("[core {tag}] {text}");
+
+    let s = shared();
+    let mut d = lock(&s.diagnostics);
+    if d.core_log.len() >= MAX_CORE_LOG {
+        d.core_log.remove(0);
+    }
+    d.core_log.push(line.clone());
+    drop(d);
+
+    // Errors and warnings also go to the app-wide log, because those are what
+    // explain a failed load — genesis_plus_gx announces a missing Sega CD BIOS
+    // only through this channel.
+    match level {
+        sys::RETRO_LOG_ERROR => crate::logging::error(line),
+        sys::RETRO_LOG_WARN => crate::logging::warn(line),
+        _ => {}
+    }
+}
+
+fn note_refusal(cmd: c_uint) {
+    let s = shared();
+    let mut d = lock(&s.diagnostics);
+    if !d.refused_commands.contains(&cmd) {
+        d.refused_commands.push(cmd);
+    }
+}
+
 unsafe extern "C" fn environment(cmd: c_uint, data: *mut c_void) -> bool {
     let s = shared();
     match sys::env_command(cmd) {
+        // Deliberately refused, and the single most important refusal in the
+        // project. Granting a hardware render context would pull in FBO
+        // handoff, get_proc_address and OpenGL on a platform where Apple has
+        // deprecated it. Saying no makes "software-rendered cores only" an
+        // invariant rather than an aspiration, and a core that needs GL fails
+        // here — visibly, in the log — instead of rendering nothing.
+        sys::RETRO_ENVIRONMENT_SET_HW_RENDER | sys::RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER => {
+            note_refusal(sys::env_command(cmd));
+            false
+        }
+        // Cores announce missing BIOS files and unsupported mappers here and
+        // nowhere else. Without it a failed load is silent.
+        sys::RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
+            if data.is_null() {
+                return false;
+            }
+            unsafe {
+                (*(data as *mut sys::LogCallback)).log = Some(rustromm_log_shim);
+            }
+            true
+        }
+        // Short player-facing notices. Recorded rather than displayed for now;
+        // the point is that they stop vanishing.
+        sys::RETRO_ENVIRONMENT_SET_MESSAGE | sys::RETRO_ENVIRONMENT_SET_MESSAGE_EXT => {
+            if data.is_null() {
+                return false;
+            }
+            // `msg` is the first field of both retro_message and
+            // retro_message_ext, so reading it is layout-safe for either.
+            let msg = unsafe { *(data as *const *const c_char) };
+            if let Some(text) = cstr_to_string(msg) {
+                let line = format!("[core MSG ] {text}");
+                let mut d = lock(&s.diagnostics);
+                if d.core_log.len() >= MAX_CORE_LOG {
+                    d.core_log.remove(0);
+                }
+                d.core_log.push(line);
+            }
+            true
+        }
+        // The core is telling us which of our save-state assumptions are wrong.
+        // Record it, then report support for none of the special cases by
+        // writing back zero — an honest answer, and the one that stops us
+        // uploading a state that could never be restored.
+        sys::RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS => {
+            if data.is_null() {
+                return false;
+            }
+            let requested = unsafe { *(data as *const u64) };
+            lock(&s.diagnostics).serialization_quirks = Some(requested);
+            unsafe { *(data as *mut u64) = 0 };
+            true
+        }
         // Answering true means the core may pass a null frame to mean "same as
         // last time". Cores rely on this for skipped frames; saying false makes
         // them redundantly re-render.
@@ -129,8 +267,9 @@ unsafe extern "C" fn environment(cmd: c_uint, data: *mut c_void) -> bool {
             }
             let raw = unsafe { *(data as *const c_uint) };
             match PixelFormat::from_raw(raw) {
-                Some(_) => {
+                Some(f) => {
                     s.pixel_format.store(raw, Ordering::SeqCst);
+                    lock(&s.diagnostics).pixel_format = Some(f.name());
                     true
                 }
                 // Refusing an unknown format is correct: the core will fall
@@ -179,8 +318,13 @@ unsafe extern "C" fn environment(cmd: c_uint, data: *mut c_void) -> bool {
             true
         }
         // Everything else is declined. The spike left thirteen commands
-        // unanswered and all six working cores booted regardless.
-        _ => false,
+        // unanswered and all six working cores booted regardless — but which
+        // ones were refused is recorded, because that list is frequently the
+        // entire explanation for a core misbehaving.
+        other => {
+            note_refusal(other);
+            false
+        }
     }
 }
 
@@ -600,6 +744,41 @@ impl Core {
         shared().wants_shutdown.load(Ordering::SeqCst)
     }
 
+    /// What the core reported about itself, for the Logs tab.
+    pub fn diagnostics(&self) -> Diagnostics {
+        lock(&shared().diagnostics).clone()
+    }
+
+    /// Whether a save state from this core may be written to disk or uploaded.
+    ///
+    /// Three quirks make that unsafe, and a frontend that ignores them promises
+    /// the user a saved game it can never give back:
+    ///
+    /// - `SINGLE_SESSION` — the state is only valid in the run that made it.
+    /// - `ENDIAN_DEPENDENT` / `PLATFORM_DEPENDENT` — a state written on x86_64
+    ///   macOS will not load on arm64 Linux. RomM is shared between machines of
+    ///   different architectures by design, so syncing these is data loss with
+    ///   extra steps.
+    ///
+    /// Returns the reason it is unsafe, or `None` when persisting is fine.
+    pub fn state_persistence_blocker(&self) -> Option<&'static str> {
+        let quirks = lock(&shared().diagnostics).serialization_quirks?;
+        if quirks & sys::RETRO_SERIALIZATION_QUIRK_SINGLE_SESSION != 0 {
+            return Some("this core's save states only work until you close the game");
+        }
+        if quirks
+            & (sys::RETRO_SERIALIZATION_QUIRK_ENDIAN_DEPENDENT
+                | sys::RETRO_SERIALIZATION_QUIRK_PLATFORM_DEPENDENT)
+            != 0
+        {
+            return Some(
+                "this core's save states are tied to this computer's processor, so they \
+                 cannot be synced to other devices",
+            );
+        }
+        None
+    }
+
     /// Battery-backed cartridge save, if this game has one.
     ///
     /// Returns `None` for cartridges without one — the spike saw 0 bytes for
@@ -644,6 +823,19 @@ impl Core {
     pub fn save_state(&mut self) -> Result<Vec<u8>> {
         let size = unsafe { (self.api.serialize_size)() };
         if size == 0 {
+            // A zero here does not always mean "unsupported". Cores that set
+            // MUST_INITIALIZE report zero until some frames have run, and a
+            // frontend that treats the first zero as final disables save states
+            // permanently for those cores.
+            let must_init = lock(&shared().diagnostics)
+                .serialization_quirks
+                .is_some_and(|q| q & sys::RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE != 0);
+            if must_init {
+                bail!(
+                    "{} cannot save a state yet — start the game first",
+                    self.info.name
+                );
+            }
             bail!("{} does not support save states", self.info.name);
         }
         let mut buf = vec![0u8; size];
@@ -914,6 +1106,134 @@ mod tests {
             // Unknown commands decline rather than crash.
             assert!(!environment(31337, std::ptr::null_mut()));
         }
+        shared().reset();
+    }
+
+    #[test]
+    fn a_hardware_render_request_is_refused_and_recorded() {
+        let _guard = exclusive();
+        shared().reset();
+        unsafe {
+            // The invariant the whole project rests on: no core ever gets a GL
+            // context, so no core can drag OpenGL back in.
+            let mut junk = [0u8; 64];
+            assert!(!environment(
+                sys::RETRO_ENVIRONMENT_SET_HW_RENDER,
+                junk.as_mut_ptr() as *mut c_void
+            ));
+            assert!(!environment(
+                sys::RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER,
+                junk.as_mut_ptr() as *mut c_void
+            ));
+        }
+        // Recorded, because a black screen with a refused 14 in the log is a
+        // diagnosis, and a black screen without one is a mystery.
+        let refused = shared()
+            .diagnostics
+            .lock()
+            .unwrap()
+            .refused_commands
+            .clone();
+        assert!(refused.contains(&sys::RETRO_ENVIRONMENT_SET_HW_RENDER));
+        assert!(refused.contains(&sys::RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER));
+        shared().reset();
+    }
+
+    #[test]
+    fn refused_commands_are_recorded_once_each() {
+        let _guard = exclusive();
+        shared().reset();
+        unsafe {
+            for _ in 0..5 {
+                let _ = environment(31337, std::ptr::null_mut());
+                let _ = environment(31338, std::ptr::null_mut());
+            }
+        }
+        let refused = shared()
+            .diagnostics
+            .lock()
+            .unwrap()
+            .refused_commands
+            .clone();
+        // Deduplicated: a command refused every frame must not fill the report.
+        assert_eq!(refused, vec![31337, 31338]);
+        shared().reset();
+    }
+
+    #[test]
+    fn core_log_messages_are_formatted_through_the_c_shim() {
+        let _guard = exclusive();
+        shared().reset();
+
+        // Gambatte logs everything as ("[Gambatte] %s\n", text), so a
+        // non-variadic callback would capture the format string and lose the
+        // entire message. This goes through the real shim.
+        let fmt = CString::new("[Test] %s loaded, %d banks").unwrap();
+        let arg = CString::new("MBC1 ROM").unwrap();
+        unsafe {
+            rustromm_log_shim(sys::RETRO_LOG_INFO, fmt.as_ptr(), arg.as_ptr(), 8);
+            rustromm_log_shim(
+                sys::RETRO_LOG_ERROR,
+                CString::new("missing BIOS: %s").unwrap().as_ptr(),
+                CString::new("lynxboot.img").unwrap().as_ptr(),
+            );
+            // Cores do pass null; must not crash inside our own callback.
+            rustromm_core_log_line(sys::RETRO_LOG_INFO, std::ptr::null());
+        }
+
+        let log = shared().diagnostics.lock().unwrap().core_log.clone();
+        assert_eq!(log.len(), 2, "a null message should be dropped, not logged");
+        assert_eq!(log[0], "[core INFO] [Test] MBC1 ROM loaded, 8 banks");
+        // The message that actually matters: without the shim this would read
+        // "missing BIOS: %s" and name no file at all.
+        assert_eq!(log[1], "[core ERR ] missing BIOS: lynxboot.img");
+
+        shared().reset();
+    }
+
+    #[test]
+    fn the_core_log_is_bounded() {
+        let _guard = exclusive();
+        shared().reset();
+        let msg = CString::new("chatter").unwrap();
+        unsafe {
+            for _ in 0..(MAX_CORE_LOG + 100) {
+                rustromm_log_shim(sys::RETRO_LOG_INFO, msg.as_ptr());
+            }
+        }
+        // A core logging every frame would otherwise grow without limit for as
+        // long as someone plays.
+        assert_eq!(
+            shared().diagnostics.lock().unwrap().core_log.len(),
+            MAX_CORE_LOG
+        );
+        shared().reset();
+    }
+
+    #[test]
+    fn serialization_quirks_decide_whether_a_state_may_be_persisted() {
+        let _guard = exclusive();
+
+        let set = |quirks: u64| {
+            shared().reset();
+            let mut q = quirks;
+            unsafe {
+                assert!(environment(
+                    sys::RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS,
+                    &mut q as *mut u64 as *mut c_void
+                ));
+            }
+            // We must report supporting none of them, or a core will assume
+            // capabilities we do not have.
+            assert_eq!(q, 0, "the frontend must write back the quirks it accepts");
+            shared().diagnostics.lock().unwrap().serialization_quirks
+        };
+
+        assert_eq!(set(0), Some(0));
+        assert_eq!(
+            set(sys::RETRO_SERIALIZATION_QUIRK_SINGLE_SESSION),
+            Some(sys::RETRO_SERIALIZATION_QUIRK_SINGLE_SESSION)
+        );
         shared().reset();
     }
 

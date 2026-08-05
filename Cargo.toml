@@ -38,3 +38,6 @@ default = ["gamepad"]
 # Feature-gated so a platform where those don't build still ships a working
 # app — you just lose controller navigation, not the whole binary.
 gamepad = ["dep:gilrs"]
+
+[build-dependencies]
+cc = "1.4.0"

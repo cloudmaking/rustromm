@@ -79,6 +79,19 @@ pub const JOYPAD_BUTTON_COUNT: usize = 16;
 // carried on regardless, so an exhaustive list is not required to boot a game.
 
 pub const RETRO_ENVIRONMENT_GET_OVERSCAN: c_uint = 2;
+/// Refusing this is what keeps the whole project tractable. A core that gets a
+/// hardware render context makes us implement FBO handoff, `get_proc_address`,
+/// context-reset callbacks and the `RETRO_HW_FRAME_BUFFER_VALID` sentinel — and
+/// drags OpenGL back in on a platform where Apple has deprecated it. Saying
+/// `false` makes "we support software-rendered cores only" an enforced
+/// invariant with a clean failure, rather than a hope.
+pub const RETRO_ENVIRONMENT_SET_HW_RENDER: c_uint = 14;
+pub const RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER: c_uint = 56;
+pub const RETRO_ENVIRONMENT_SET_MESSAGE_EXT: c_uint = 60;
+/// Tells the frontend which of its save-state assumptions are wrong for this
+/// core. Ignoring it is how a frontend ends up syncing states that can never be
+/// restored.
+pub const RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: c_uint = 87;
 pub const RETRO_ENVIRONMENT_GET_CAN_DUPE: c_uint = 3;
 pub const RETRO_ENVIRONMENT_SET_MESSAGE: c_uint = 6;
 pub const RETRO_ENVIRONMENT_SHUTDOWN: c_uint = 7;
@@ -117,6 +130,54 @@ pub const RETRO_LOG_DEBUG: c_uint = 0;
 pub const RETRO_LOG_INFO: c_uint = 1;
 pub const RETRO_LOG_WARN: c_uint = 2;
 pub const RETRO_LOG_ERROR: c_uint = 3;
+
+// ─── Serialization quirks ────────────────────────────────────────────────────
+//
+// A core reports these through `SET_SERIALIZATION_QUIRKS`. Two of them make
+// save states unsafe to persist, which matters because states are meant to sync
+// to RomM — uploading one that can never be restored is worse than not having
+// the feature.
+
+/// `retro_serialize_size` and `retro_serialize` fail until the core has run
+/// some frames. A frontend that treats an early zero as "states unsupported"
+/// permanently disables them for such a core.
+pub const RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE: u64 = 1 << 1;
+pub const RETRO_SERIALIZATION_QUIRK_CORE_VARIABLE_SIZE: u64 = 1 << 2;
+pub const RETRO_SERIALIZATION_QUIRK_FRONT_VARIABLE_SIZE: u64 = 1 << 3;
+/// The state is only valid within the session that produced it. Writing one to
+/// disk, let alone uploading it, guarantees it will not load later.
+pub const RETRO_SERIALIZATION_QUIRK_SINGLE_SESSION: u64 = 1 << 4;
+/// A state made on one endianness or platform will not load on another — so it
+/// must never be synced to a server shared by machines of different
+/// architectures, which is exactly what RomM is.
+pub const RETRO_SERIALIZATION_QUIRK_ENDIAN_DEPENDENT: u64 = 1 << 5;
+pub const RETRO_SERIALIZATION_QUIRK_PLATFORM_DEPENDENT: u64 = 1 << 6;
+
+// ─── Log callback ────────────────────────────────────────────────────────────
+
+/// The core fills nothing; the *frontend* writes its function pointer here and
+/// the core then calls it.
+#[repr(C)]
+pub struct LogCallback {
+    pub log: Option<LogPrintfFn>,
+}
+
+/// Variadic, exactly as in C: `void (*)(enum retro_log_level, const char *, ...)`.
+///
+/// Rust can *declare* this type on stable but cannot *define* a function with
+/// this signature — `c_variadic` is still unstable. The pointer we hand over is
+/// therefore a small C shim; see `src/libretro/shim/log_shim.c`. Substituting a
+/// non-variadic function here loses every argument, which is not a cosmetic
+/// loss: Gambatte logs all of its messages as `("[Gambatte] %s\n", text)`, so
+/// the entire content is in the varargs.
+pub type LogPrintfFn = unsafe extern "C" fn(level: c_uint, fmt: *const c_char, ...);
+
+/// `SET_MESSAGE`. A short string the core wants shown to the player.
+#[repr(C)]
+pub struct Message {
+    pub msg: *const c_char,
+    pub frames: c_uint,
+}
 
 // ─── Structs ─────────────────────────────────────────────────────────────────
 
