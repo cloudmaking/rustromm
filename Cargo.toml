@@ -20,6 +20,7 @@ egui = "0.35.0"
 egui_extras = { version = "0.35.0", features = ["all_loaders"] }
 gilrs = { version = "0.11.2", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+libloading = "0.8"
 reqwest = { version = "0.13.4", features = ["blocking", "json", "query"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
