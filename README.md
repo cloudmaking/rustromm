@@ -123,7 +123,8 @@ On Linux you may also need the usual GUI development libraries:
 
 ```sh
 sudo apt install libxkbcommon-dev libwayland-dev libx11-dev \
-                 libxcursor-dev libxrandr-dev libxi-dev
+                 libxcursor-dev libxrandr-dev libxi-dev \
+                 libudev-dev libgtk-3-dev
 ```
 
 ## Using it
@@ -169,7 +170,13 @@ retroarch -L /usr/lib/libretro/snes9x_libretro.so
 Use `{rom}` where the file path should go. If you leave it out, the path is appended at the
 end — which is what almost every emulator expects, so usually you can just name the program.
 
-With nothing configured, Play hands the file to your operating system's default handler.
+**Don't want to type a path?** Hit **Detect** — it looks for RetroArch, PPSSPP, Dolphin and
+friends in the usual install locations and on your `PATH`. **Browse…** opens a normal file
+picker, which is easier on macOS where the real binary lives inside a `.app` bundle.
+
+With nothing configured, Play tells you so and takes you here rather than guessing. Handing
+the file to the OS was the old behaviour and it was a bad idea — no operating system has a
+handler for `.gbc` or `.smc`, so it failed in exactly the case it was reached in.
 
 ### Where things are stored
 
