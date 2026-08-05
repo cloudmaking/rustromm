@@ -765,9 +765,9 @@ impl RustRomm {
                 // once one is plugged in — otherwise it's noise for mouse users.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let hint = if self.gamepads.any_connected() {
-                        "D-pad move · A download/play · B back · LB/RB console"
+                        "D-pad move  ·  A download/play  ·  B back  ·  LB/RB console"
                     } else {
-                        "↑↓ move · Enter download/play · Esc back · PgUp/PgDn console"
+                        "Up/Down move  ·  Enter download/play  ·  Esc back  ·  PgUp/PgDn console"
                     };
                     ui.label(egui::RichText::new(hint).weak().small());
                 });
@@ -878,7 +878,7 @@ impl RustRomm {
                                 |ui| match dl {
                                     Some(d) if d.finished.is_some() => {
                                         let path = d.finished.clone().unwrap();
-                                        if ui.button("▶ Play").clicked() {
+                                        if ui.button("Play").clicked() {
                                             to_launch = Some((rom.clone(), path.clone()));
                                         }
                                         if ui.button("Folder").clicked() {
@@ -925,7 +925,7 @@ impl RustRomm {
                     let page = self.offset / PAGE_SIZE + 1;
                     let pages = (self.total_roms + PAGE_SIZE - 1) / PAGE_SIZE;
                     if ui
-                        .add_enabled(self.offset > 0, egui::Button::new("‹ Previous"))
+                        .add_enabled(self.offset > 0, egui::Button::new("Previous"))
                         .clicked()
                     {
                         want_fetch = Some((self.offset - PAGE_SIZE).max(0));
@@ -934,7 +934,7 @@ impl RustRomm {
                     if ui
                         .add_enabled(
                             self.offset + PAGE_SIZE < self.total_roms,
-                            egui::Button::new("Next ›"),
+                            egui::Button::new("Next"),
                         )
                         .clicked()
                     {
@@ -977,7 +977,7 @@ impl RustRomm {
         let mut save_now = false;
         egui::CentralPanel::default_margins().show(root, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("‹ Back").clicked() {
+                if ui.button("Back").clicked() {
                     self.screen = Screen::Library;
                 }
                 ui.heading("Settings");
