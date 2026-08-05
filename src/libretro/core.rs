@@ -284,7 +284,7 @@ pub struct CoreInfo {
 impl CoreInfo {
     pub fn handles_extension(&self, ext: &str) -> bool {
         let ext = ext.trim_start_matches('.').to_ascii_lowercase();
-        self.extensions.iter().any(|e| *e == ext)
+        self.extensions.contains(&ext)
     }
 }
 

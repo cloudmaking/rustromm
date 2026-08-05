@@ -21,15 +21,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    label: Linux x86_64 }
-          - { os: ubuntu-24.04-arm, label: Linux arm64 }
+          # `cores` is the buildbot path for this target, or empty when no cores
+          # are published for it. Only Windows arm64 is empty — the buildbot has
+          # windows/x86 and windows/x86_64 and nothing else, so an arm64 Windows
+          # build has no core it can dlopen. See docs/libretro-spike.md.
+          - { os: ubuntu-latest,    label: Linux x86_64,   cores: "linux/x86_64",     ext: so }
+          - { os: ubuntu-24.04-arm, label: Linux arm64,    cores: "linux/aarch64",    ext: so }
           # macos-latest is Apple Silicon. There is deliberately no Intel macOS
           # entry: the macos-13 image is being retired and its runners no longer
           # get picked up, which left jobs queued indefinitely. The Intel binary
           # is still released, cross-compiled from this same runner.
-          - { os: macos-latest,     label: macOS arm64 }
-          - { os: windows-latest,   label: Windows x86_64 }
-          - { os: windows-11-arm,   label: Windows arm64 }
+          - { os: macos-latest,     label: macOS arm64,    cores: "apple/osx/arm64",  ext: dylib }
+          - { os: windows-latest,   label: Windows x86_64, cores: "windows/x86_64",   ext: dll }
+          - { os: windows-11-arm,   label: Windows arm64,  cores: "",                 ext: dll }
 
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +66,36 @@ jobs:
       # the unit, API and headless UI suites — no RomM server needed.
       - name: Test
         run: cargo test --verbose
+
+      # Everything above runs without a core. This step is the one that proves
+      # embedded emulation actually works on this platform: it fetches a stock
+      # core and drives it through load, run, video, audio, input and save
+      # states. Gambatte accepts a zeroed 32 KB buffer as a cartridge, so no ROM
+      # is downloaded or shipped.
+      - name: Fetch a libretro core
+        if: matrix.cores != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://buildbot.libretro.com/nightly/${{ matrix.cores }}/latest/gambatte_libretro.${{ matrix.ext }}.zip"
+          mkdir -p .cores
+          curl -fsSL --retry 3 -o .cores/core.zip "$url"
+          # unzip is not on the Windows runners; Python is, everywhere.
+          python3 -c "import zipfile,sys; zipfile.ZipFile('.cores/core.zip').extractall('.cores')"
+          ls -l .cores
+
+      - name: Test against a real core
+        if: matrix.cores != ''
+        shell: bash
+        env:
+          RUSTROMM_TEST_CORE: .cores/gambatte_libretro.${{ matrix.ext }}
+        run: cargo test --test core_tests -- --nocapture
+
+      # Said out loud rather than silently skipped, so nobody reads a green tick
+      # as coverage this target does not have.
+      - name: Note the uncovered target
+        if: matrix.cores == ''
+        run: echo "::warning::No libretro cores are published for this target, so embedded emulation is untested here. Windows on ARM should run the x86_64 build."
 
   lint:
     name: Format and clippy
