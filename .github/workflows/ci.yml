@@ -48,7 +48,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev \
-            libxcursor-dev libxrandr-dev libxi-dev
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libudev-dev
 
       - name: Build
         run: cargo build --all-targets --verbose
@@ -75,7 +76,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev \
-            libxcursor-dev libxrandr-dev libxi-dev
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libudev-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check

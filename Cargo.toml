@@ -18,6 +18,7 @@ directories = "6.0.0"
 eframe = { version = "0.35.0", features = ["persistence"] }
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", features = ["all_loaders"] }
+gilrs = { version = "0.11.2", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 reqwest = { version = "0.13.4", features = ["blocking", "json", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -28,3 +29,10 @@ urlencoding = "2.1.3"
 egui_kittest = "0.35.0"
 httpmock = "0.8.3"
 tempfile = "3.27.0"
+
+[features]
+default = ["gamepad"]
+# gilrs pulls in native input libraries (libudev on Linux, XInput on Windows).
+# Feature-gated so a platform where those don't build still ships a working
+# app — you just lose controller navigation, not the whole binary.
+gamepad = ["dep:gilrs"]
