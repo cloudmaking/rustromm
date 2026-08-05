@@ -55,6 +55,13 @@ architecture — including both arm64 targets. The Intel macOS binary is cross-c
 an Apple Silicon runner, since GitHub is retiring its Intel macOS image, so it is the one
 build not covered by a test run.
 
+> ### ⚠️ Your OS will block the first launch
+>
+> These builds are **unsigned**, so macOS and Windows both refuse to run them until you say
+> otherwise. This is expected, it is not a sign anything is wrong, and the fix is one
+> command. See below — and [why it happens](#why-does-my-os-warn-about-this) if you'd
+> rather know than trust me.
+
 ### First launch: the OS will block it
 
 These builds are **unsigned and un-notarized**, and each release is a plain executable in an
@@ -86,9 +93,38 @@ If you'd rather not use the terminal, run it once, let it be blocked, then go to
 tar -xzf rustromm-linux-x86_64.tar.gz && chmod +x rustromm && ./rustromm
 ```
 
-Making this warning go away for everyone needs an Apple Developer account (£79/yr) for
-notarization and a code-signing certificate on Windows. Worth it only if the project gets
-real users.
+### Why does my OS warn about this?
+
+Because nobody has paid Apple or Microsoft to vouch for it. That's the whole reason — it
+says nothing about what the code does, which you can read in full in this repository.
+
+**On macOS**, getting rid of the warning properly means three things, all requiring an
+[Apple Developer Program](https://developer.apple.com/programs/) membership at **~£79/yr**:
+signing with a Developer ID certificate, notarizing (uploading the build so Apple can scan
+it), and stapling the resulting ticket to the download.
+
+There's a wrinkle even then: **a ticket cannot be stapled to a bare executable**. Stapling
+only works on `.app` bundles, `.dmg` and `.pkg`, so going legitimate also means building a
+proper app bundle and wrapping it in a disk image.
+
+Things that sound like they'd help but don't:
+
+| | |
+|---|---|
+| Ad-hoc signing (`codesign -s -`) | No effect on Gatekeeper for downloaded files |
+| Shipping a `.app` bundle | Still quarantined, still needs Open Anyway |
+| Right-click → Open | Removed in macOS Sequoia, and never applied to bare executables |
+
+**On Windows**, SmartScreen trusts a publisher either through an EV code-signing certificate
+(around **£300/yr**) or by accumulating download reputation over months.
+
+So: the warning is honest, and removing it is a subscription rather than a code change.
+Until this has enough users to justify that, the one-line `xattr` fix above is the answer.
+
+**One free workaround that genuinely avoids it:** the quarantine flag is set by whatever
+*downloads* the file — Safari sets it, `curl` does not. So installing through a Homebrew
+tap (which fetches with curl) skips Gatekeeper entirely, with no warning and no terminal
+gymnastics. Not set up yet; it is the obvious next step for distribution.
 
 ### From source
 
