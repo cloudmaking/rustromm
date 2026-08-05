@@ -55,8 +55,40 @@ architecture — including both arm64 targets. The Intel macOS binary is cross-c
 an Apple Silicon runner, since GitHub is retiring its Intel macOS image, so it is the one
 build not covered by a test run.
 
-macOS and Windows builds are unsigned, so the OS will warn on first launch — on macOS,
-right-click the app and choose Open; on Windows, More info → Run anyway.
+### First launch: the OS will block it
+
+These builds are **unsigned and un-notarized**, and each release is a plain executable in an
+archive rather than an installer. Both operating systems will object.
+
+**macOS** — you'll get *"Apple could not verify 'rustromm' is free of malware."* Extract and
+clear the quarantine flag your browser attached on download:
+
+```sh
+cd ~/Downloads
+tar -xzf rustromm-macos-arm64.tar.gz     # or -x86_64 on an Intel Mac
+xattr -c rustromm
+chmod +x rustromm
+./rustromm
+```
+
+Do **not** follow the usual "right-click and choose Open" advice — Apple removed that
+bypass in macOS Sequoia, and it never applied to a bare executable like this one anyway.
+If you'd rather not use the terminal, run it once, let it be blocked, then go to
+**System Settings → Privacy & Security** and click **Open Anyway** next to the warning.
+
+**Windows** — SmartScreen will show *"Windows protected your PC"*. Click **More info**, then
+**Run anyway**. If the file is blocked outright, right-click the zip → Properties → tick
+**Unblock** before extracting.
+
+**Linux** — no gatekeeping, just make it executable:
+
+```sh
+tar -xzf rustromm-linux-x86_64.tar.gz && chmod +x rustromm && ./rustromm
+```
+
+Making this warning go away for everyone needs an Apple Developer account (£79/yr) for
+notarization and a code-signing certificate on Windows. Worth it only if the project gets
+real users.
 
 ### From source
 

@@ -52,6 +52,22 @@ The one that matters most.
 
 ## macOS and Windows
 
-Both binaries are unsigned, so first launch needs the OS override — right-click
-→ Open on macOS, More info → Run anyway on Windows. Worth confirming the app
-starts at all, that the window is the right size, and that text isn't clipped.
+Both binaries are unsigned and un-notarized, so first launch is blocked.
+
+**macOS** shows *"Apple could not verify 'rustromm' is free of malware."* The fix
+is to clear the download quarantine flag:
+
+```sh
+xattr -c rustromm && chmod +x rustromm && ./rustromm
+```
+
+The commonly-given "right-click → Open" advice does **not** work here, on two
+counts: Apple removed that bypass in macOS Sequoia, and it only ever applied to
+`.app` bundles, whereas each release is a bare executable. The GUI route is
+System Settings → Privacy & Security → Open Anyway, after being blocked once.
+
+**Windows**: SmartScreen → More info → Run anyway.
+
+Once it starts, confirm the window is a sensible size, that text isn't clipped,
+and that the font renders — the tofu bug in v0.2.0 was a font problem and could
+recur on a platform with different bundled fonts.

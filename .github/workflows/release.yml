@@ -123,5 +123,18 @@ jobs:
           body: |
             Desktop client for RomM.
 
-            **These binaries are unsigned.** macOS: right-click → Open.
-            Windows: More info → Run anyway.
+            **These binaries are unsigned, so your OS will block the first launch.**
+
+            **macOS** — "Apple could not verify this is free of malware". Clear the
+            download quarantine flag:
+            ```sh
+            tar -xzf rustromm-macos-arm64.tar.gz
+            xattr -c rustromm && chmod +x rustromm && ./rustromm
+            ```
+            Right-click → Open does *not* work: Apple removed it in Sequoia, and
+            these are bare executables rather than `.app` bundles. The GUI
+            alternative is System Settings → Privacy & Security → Open Anyway.
+
+            **Windows** — SmartScreen → More info → Run anyway.
+
+            **Linux** — `chmod +x rustromm && ./rustromm`
