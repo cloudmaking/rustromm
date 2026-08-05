@@ -97,6 +97,48 @@ jobs:
         if: matrix.cores == ''
         run: echo "::warning::No libretro cores are published for this target, so embedded emulation is untested here. Windows on ARM should run the x86_64 build."
 
+  # The single biggest unknown in the whole rewrite.
+  #
+  # The libretro buildbot publishes no arm64 Windows cores — windows/x86 and
+  # windows/x86_64 and nothing else — and a native ARM64 process cannot
+  # LoadLibrary an x64 DLL. The proposed answer is to ship the x86_64 build to
+  # Windows on ARM and let Prism emulate it, which only works if an emulated x64
+  # process can load an x64 core. Nobody has verified that.
+  #
+  # If this job fails, Windows on ARM has no path at all and the README must say
+  # so. It is one job and it answers the question before anything is built on
+  # the assumption.
+  windows-arm-under-emulation:
+    name: Windows on ARM runs the x86_64 build
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately the x64 toolchain on an ARM runner: this is exactly the
+      # configuration a Windows-on-ARM user would download.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-arm-x64-emulated
+
+      - name: Fetch the x86_64 core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .cores
+          curl -fsSL --retry 3 -o .cores/core.zip \
+            https://buildbot.libretro.com/nightly/windows/x86_64/latest/gambatte_libretro.dll.zip
+          python3 -c "import zipfile; zipfile.ZipFile('.cores/core.zip').extractall('.cores')"
+
+      - name: Load an x64 core from an x64 process, emulated
+        shell: bash
+        env:
+          RUSTROMM_TEST_CORE: .cores/gambatte_libretro.dll
+        run: cargo test --target x86_64-pc-windows-msvc --test core_tests -- --nocapture
+
   lint:
     name: Format and clippy
     runs-on: ubuntu-latest
