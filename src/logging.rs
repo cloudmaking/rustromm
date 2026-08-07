@@ -130,6 +130,14 @@ pub fn report() -> String {
     }
     out.push('\n');
 
+    // Everything embedded emulation needs to be diagnosed from a paste. Without
+    // this a report says which app version failed and nothing about the core,
+    // which is where the failure almost always is.
+    if let Some(extra) = emulation_context() {
+        out.push_str(&extra);
+        out.push('\n');
+    }
+
     let entries = entries();
     if entries.is_empty() {
         out.push_str("(no entries)\n");
@@ -139,6 +147,50 @@ pub fn report() -> String {
         out.push_str(&format!("{:8.2}s {} {}\n", e.at, e.level.tag(), e.message));
     }
     out
+}
+
+/// Core-side context for `report()`.
+///
+/// Returns `None` when no core has been loaded this session, so a report from
+/// someone who only browsed their library stays short.
+fn emulation_context() -> Option<String> {
+    let d = crate::libretro::core::diagnostics_global();
+    if d.core_log.is_empty() && d.refused_commands.is_empty() && d.pixel_format.is_none() {
+        return None;
+    }
+    let mut out = String::from("\n--- emulation ---\n");
+    if let Some(fmt) = d.pixel_format {
+        out.push_str(&format!("pixel fmt {fmt}\n"));
+    }
+    if let Some(q) = d.serialization_quirks {
+        out.push_str(&format!("quirks    {q:#x}\n"));
+    }
+    if !d.refused_commands.is_empty() {
+        // Frequently the whole explanation. A refused 14 means the core wanted
+        // an OpenGL context and gave up, which reaches the user as a black
+        // screen and would otherwise reach us as nothing at all.
+        out.push_str(&format!(
+            "refused   {}\n",
+            d.refused_commands
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if !d.core_log.is_empty() {
+        out.push_str(&format!(
+            "\n--- what the core said ({}) ---\n",
+            d.core_log.len()
+        ));
+        // Only the tail: a chatty core would otherwise bury the app's own log,
+        // and the last lines are the ones next to the failure.
+        for line in d.core_log.iter().rev().take(40).rev() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -183,6 +235,40 @@ mod tests {
         assert!(text.contains("=== RUSTROMM LOG ==="));
         assert!(text.contains("platform"));
         assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn a_report_from_a_browsing_session_carries_no_emulation_section() {
+        let _guard = exclusive();
+        // Also holds the lock for the core's process-global state, which this
+        // test resets. Holding only the logging lock would serialise against
+        // the wrong set of tests.
+        let _core = crate::libretro::core::global_test_guard();
+        clear();
+        // Someone who only browsed their library should get a short report.
+        // Padding it with empty emulation headings makes the real content
+        // harder to find in a pasted message.
+        crate::libretro::core::reset_for_tests();
+        info("connected");
+        let text = report();
+        assert!(!text.contains("--- emulation ---"), "got: {text}");
+    }
+
+    #[test]
+    fn a_report_after_playing_carries_what_the_core_said() {
+        let _guard = exclusive();
+        let _core = crate::libretro::core::global_test_guard();
+        clear();
+        crate::libretro::core::reset_for_tests();
+        crate::libretro::core::record_for_tests("[core ERR ] missing BIOS: lynxboot.img", 14);
+
+        let text = report();
+        assert!(text.contains("--- emulation ---"), "got: {text}");
+        // The refused command list is often the entire diagnosis.
+        assert!(text.contains("refused"), "got: {text}");
+        assert!(text.contains("14"), "got: {text}");
+        assert!(text.contains("missing BIOS: lynxboot.img"), "got: {text}");
+        crate::libretro::core::reset_for_tests();
     }
 
     #[test]

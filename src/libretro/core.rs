@@ -911,6 +911,37 @@ pub fn diagnostics_global() -> Diagnostics {
     lock(&shared().diagnostics).clone()
 }
 
+/// The lock guarding all process-global emulation state during tests.
+///
+/// Lives here because the state does. Two test modules each having their own
+/// mutex would not serialise anything — which is exactly the bug this exists to
+/// prevent, and it has now appeared four times in this project (the config env
+/// var, the log ring buffer, the core globals, and the log report). Any test in
+/// any module that touches core globals must hold THIS.
+#[doc(hidden)]
+pub static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[doc(hidden)]
+pub fn global_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reset the process-global diagnostics. Test-only.
+#[doc(hidden)]
+pub fn reset_for_tests() {
+    shared().reset();
+}
+
+/// Inject a core log line and a refused command. Test-only, so the log report
+/// can be tested without loading a core.
+#[doc(hidden)]
+pub fn record_for_tests(line: &str, refused: u32) {
+    let s = shared();
+    let mut d = lock(&s.diagnostics);
+    d.core_log.push(line.to_string());
+    d.refused_commands.push(refused);
+}
+
 /// Where a core's shared library lives on disk for the running platform.
 pub fn core_file_name(core: &str) -> String {
     if cfg!(target_os = "windows") {
@@ -938,15 +969,11 @@ mod tests {
     /// neighbour's assertions and the failure looks like a logic bug rather
     /// than a scheduling one.
     ///
-    /// Serialise them. This is the third time this bug class has appeared in
-    /// this project (after the config env var and the log ring buffer), and
-    /// each time it presented as an intermittent failure in unrelated code.
-    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
-
+    /// Serialise them, using the same lock every other module must use — see
+    /// `GLOBAL_TEST_LOCK`. A private mutex here would serialise this module
+    /// against itself and nothing else.
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        // Poisoning only means an earlier test panicked; the globals are still
-        // ours to reset.
-        GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+        super::global_test_guard()
     }
 
     fn info(exts: &[&str], need_fullpath: bool) -> CoreInfo {
