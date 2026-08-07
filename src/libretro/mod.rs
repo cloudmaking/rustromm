@@ -12,5 +12,6 @@ pub mod audio;
 pub mod core;
 pub mod cores;
 pub mod emu;
+pub mod saves;
 pub mod sys;
 pub mod video;

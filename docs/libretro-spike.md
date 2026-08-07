@@ -193,3 +193,41 @@ The fix is nineteen lines of C doing the `vsnprintf`, in
 ```
 
 It compiles on all six targets in CI.
+
+---
+
+## Update: the reported save size lies, twice
+
+Found while wiring up battery saves, and worth its own section because getting it
+wrong silently loses people's games.
+
+`retro_get_memory_size(RETRO_MEMORY_SAVE_RAM)` is not stable after
+`retro_load_game`. Genesis Plus GX, loading Landstalker:
+
+| When | Reported SRAM |
+|---|---|
+| Immediately after `retro_load_game` | **65536** bytes |
+| After 1 frame | **0** |
+| After 60 frames | **8240** |
+| After 600 frames | 8240 |
+
+Only the last is true. The obvious implementation — read the size right after
+load, restore the save into it — fails in two ways at once:
+
+- Restoring an 8240-byte save against the provisional 65536 fails the length
+  check, so the player's save silently does not load.
+- Writing at that moment puts bytes into a buffer the core is about to
+  reallocate.
+
+And the transient **0** is worse than either, because it looks exactly like "this
+cartridge has no battery". A frontend that concluded that would refuse to save
+the game at all, forever, and the player would have no idea why.
+
+RustRomM therefore touches SRAM only once the reported size has been identical on
+two consecutive checks, 60 frames apart — `saves::SETTLE_FRAMES`. Restore happens
+then, not at load. Nothing is written before it.
+
+Two further games confirm the pattern is per-cartridge rather than per-core: 3
+Ninjas Kick Back and Phantasy Star II both settle at 0, which is correct — those
+cartridges have no battery. So the transient 65536 is not a constant to subtract,
+it is genuinely meaningless.

@@ -32,6 +32,7 @@ use anyhow::Result;
 
 use super::audio::{AudioBuffer, Resampler};
 use super::core::{AvInfo, Core, CoreInfo, Diagnostics};
+use super::saves;
 use super::video::Frame;
 use crate::logging;
 
@@ -111,7 +112,6 @@ impl Emulator {
         rom: Vec<u8>,
         system_dir: PathBuf,
         save_dir: PathBuf,
-        initial_sram: Option<Vec<u8>>,
         audio: Option<Arc<Mutex<AudioBuffer>>>,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
@@ -141,7 +141,6 @@ impl Emulator {
                     rom,
                     system_dir,
                     save_dir,
-                    initial_sram,
                     audio,
                 )
             })?;
@@ -263,7 +262,6 @@ fn run_thread(
     rom: Vec<u8>,
     system_dir: PathBuf,
     save_dir: PathBuf,
-    initial_sram: Option<Vec<u8>>,
     audio: Option<Arc<Mutex<AudioBuffer>>>,
 ) {
     let mut core = match Core::load(&core_path, &system_dir, &save_dir) {
@@ -290,13 +288,20 @@ fn run_thread(
         info.name, av.fps, av.sample_rate
     ));
 
-    // Restore the battery save before the first frame, or the game boots,
-    // sees no save, and may overwrite it.
-    if let Some(sram) = initial_sram {
-        match core.restore_save_ram(&sram) {
-            Ok(()) => logging::info(format!("restored {} bytes of battery save", sram.len())),
-            Err(e) => logging::warn(format!("could not restore battery save: {e}")),
-        }
+    // The battery save is NOT restored here, even though this is the obvious
+    // place for it. See saves::SETTLE_FRAMES — the size a core reports right
+    // after load_game can be wrong, and Genesis Plus GX gets it wrong twice
+    // before settling. Restoring happens in the loop below once two consecutive
+    // checks agree.
+    let sram_path = saves::sram_path(&save_dir, &rom_path);
+    let mut last_written: Option<Vec<u8>> = None;
+    let pending_restore = saves::read(&sram_path);
+    if let Some(s) = pending_restore.as_ref() {
+        logging::info(format!(
+            "found a {} byte battery save at {}",
+            s.len(),
+            sram_path.display()
+        ));
     }
 
     if ready.send(Ok((info, av))).is_err() {
@@ -312,6 +317,12 @@ fn run_thread(
     let mut deadline = Instant::now() + period;
     let mut rate_window = Instant::now();
     let mut rate_frames = 0u32;
+    let mut last_flush = Instant::now();
+    // Save-size settling, per saves::SETTLE_FRAMES.
+    let mut frames_run: u32 = 0;
+    let mut settled_size: Option<usize> = None;
+    let mut restore_done = pending_restore.is_none();
+    let mut pending_restore = pending_restore;
 
     while shared.running.load(Ordering::Relaxed) {
         // Drain commands without blocking. Blocking here would stop the core
@@ -381,6 +392,43 @@ fn run_thread(
             break;
         }
 
+        frames_run += 1;
+        // Wait for the reported save size to agree with itself before trusting
+        // it, then restore. Doing this early is what makes the save actually
+        // load; doing it at load_game does not work.
+        if !restore_done && frames_run >= saves::SETTLE_FRAMES {
+            let size = core.save_ram().map(|v| v.len());
+            match settled_size {
+                None => {
+                    settled_size = size;
+                    frames_run = saves::SETTLE_FRAMES - saves::SETTLE_RECHECK_FRAMES;
+                }
+                Some(prev) if Some(prev) == size => {
+                    if let Some(save) = pending_restore.take() {
+                        match core.restore_save_ram(&save) {
+                            Ok(()) => {
+                                logging::info(format!(
+                                    "restored {} bytes of battery save",
+                                    save.len()
+                                ));
+                                last_written = Some(save);
+                            }
+                            // A mismatch here means the save belongs to another
+                            // game, or was written by a core with a different
+                            // layout. Refusing keeps the file intact so it can
+                            // still be recovered by hand.
+                            Err(e) => logging::error(format!(
+                                "could not restore the battery save, and it has NOT been \
+                                 overwritten: {e}"
+                            )),
+                        }
+                    }
+                    restore_done = true;
+                }
+                Some(_) => settled_size = size,
+            }
+        }
+
         rate_frames += 1;
         if rate_window.elapsed() >= Duration::from_secs(1) {
             let fps = rate_frames as f64 / rate_window.elapsed().as_secs_f64();
@@ -391,6 +439,14 @@ fn run_thread(
             rate_window = Instant::now();
         }
 
+        // Flush on a timer rather than only at exit. A core segfault does not
+        // unwind, so no destructor runs and anything held only in the core's
+        // memory is gone — Handy demonstrated exactly that crash in the spike.
+        if restore_done && last_flush.elapsed() >= saves::FLUSH_INTERVAL {
+            last_flush = Instant::now();
+            flush_sram(&core, &sram_path, &mut last_written);
+        }
+
         let (sleep_for, next) = pace(Instant::now(), deadline, period);
         deadline = next;
         if !sleep_for.is_zero() {
@@ -398,10 +454,47 @@ fn run_thread(
         }
     }
 
+    // Final flush before the core unloads, so quitting never costs progress —
+    // but only if the save size ever settled. Writing a provisional size on the
+    // way out would corrupt a good file at the worst possible moment.
+    if restore_done {
+        flush_sram(&core, &sram_path, &mut last_written);
+    }
+
     shared.finished.store(true, Ordering::SeqCst);
     logging::info("emulation stopped");
     // `core` drops here, on the thread that loaded it, releasing the
     // single-instance flag so another game can start.
+}
+
+/// Write the core's battery save out, if it changed and is safe to write.
+fn flush_sram(core: &Core, path: &std::path::Path, last: &mut Option<Vec<u8>>) {
+    let current = core.save_ram();
+    let on_disk = last.as_deref();
+    match saves::decide(current.as_deref(), last.as_deref(), on_disk) {
+        saves::Decision::Write => {
+            let Some(data) = current else { return };
+            match saves::write_atomically(path, &data) {
+                Ok(()) => {
+                    logging::info(format!("saved {} bytes to {}", data.len(), path.display()));
+                    *last = Some(data);
+                }
+                // Reported rather than silently swallowed: a save that is not
+                // reaching the disk is the thing a player most needs to know
+                // about, and they cannot see this any other way.
+                Err(e) => logging::error(format!("COULD NOT SAVE to {}: {e:#}", path.display())),
+            }
+        }
+        saves::Decision::RefuseUniform => {
+            logging::error(format!(
+                "refusing to overwrite {} — the core is reporting blank save memory, \
+                 which usually means it failed to initialise. Your existing save is \
+                 untouched.",
+                path.display()
+            ));
+        }
+        saves::Decision::Unchanged | saves::Decision::NoSaveMemory => {}
+    }
 }
 
 #[cfg(test)]

@@ -630,8 +630,7 @@ impl RustRomm {
                         }
                     }
                     let sink = self.audio.as_ref().map(|a| Arc::clone(&a.buffer));
-                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, None, sink)
-                    {
+                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, sink) {
                         Ok(emu) => {
                             logging::info(format!(
                                 "playing {title} on {} {}",
