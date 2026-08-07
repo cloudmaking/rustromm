@@ -120,6 +120,63 @@ impl Gamepads {
             .is_some_and(|g| g.gamepads().any(|(_, pad)| pad.is_connected()))
     }
 
+    /// The pressed RetroPad buttons and left-stick position, right now.
+    ///
+    /// Menu navigation is event-driven — one press, one move — but a game needs
+    /// *held* state every frame: walking left means LEFT is down for a hundred
+    /// frames, which produces exactly one gilrs event. So this polls current
+    /// state rather than draining the queue.
+    ///
+    /// `gilrs` still needs its event queue pumped for the state to update, and
+    /// `poll()` does that. Both are called each frame.
+    pub fn retropad_state(&self) -> (u16, f32, f32) {
+        let Some(gilrs) = self.gilrs.as_ref() else {
+            return (0, 0.0, 0.0);
+        };
+        let mut mask = 0u16;
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        for (_, pad) in gilrs.gamepads() {
+            if !pad.is_connected() {
+                continue;
+            }
+            for b in [
+                gilrs::Button::DPadUp,
+                gilrs::Button::DPadDown,
+                gilrs::Button::DPadLeft,
+                gilrs::Button::DPadRight,
+                gilrs::Button::South,
+                gilrs::Button::East,
+                gilrs::Button::West,
+                gilrs::Button::North,
+                gilrs::Button::LeftTrigger,
+                gilrs::Button::RightTrigger,
+                gilrs::Button::LeftTrigger2,
+                gilrs::Button::RightTrigger2,
+                gilrs::Button::LeftThumb,
+                gilrs::Button::RightThumb,
+                gilrs::Button::Start,
+                gilrs::Button::Select,
+            ] {
+                if pad.is_pressed(b) {
+                    if let Some(id) = crate::play::retropad_id_for_button(b) {
+                        mask |= 1 << id;
+                    }
+                }
+            }
+            // Several pads connected means whichever moved last wins, which is
+            // right for one player on a machine with a pad and a wheel plugged in.
+            let ax = pad.value(gilrs::Axis::LeftStickX);
+            let ay = pad.value(gilrs::Axis::LeftStickY);
+            if ax.abs() > x.abs() {
+                x = ax;
+            }
+            if ay.abs() > y.abs() {
+                y = ay;
+            }
+        }
+        (mask, x, y)
+    }
+
     /// Drain pending controller events into navigation actions.
     pub fn poll(&mut self) -> Vec<NavAction> {
         let Some(gilrs) = self.gilrs.as_mut() else {

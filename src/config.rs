@@ -79,6 +79,31 @@ impl Config {
     }
 
     /// Resolved download directory, creating nothing — callers create on demand.
+    /// Where downloaded libretro cores are cached.
+    ///
+    /// Beside the config rather than in Downloads: these are program files the
+    /// user never chose to fetch, and putting them in a visible folder invites
+    /// someone to tidy them away mid-session.
+    pub fn cores_dir(&self) -> PathBuf {
+        Self::path()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("cores")
+    }
+
+    /// The libretro "system" directory — where cores look for BIOS files.
+    ///
+    /// Cores stat this during `retro_init`, before anything else, so it has to
+    /// exist and be stable across runs.
+    pub fn system_dir(&self) -> PathBuf {
+        Self::path()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("system")
+    }
+
     pub fn resolved_download_dir(&self) -> PathBuf {
         if !self.download_dir.trim().is_empty() {
             return PathBuf::from(self.download_dir.trim());

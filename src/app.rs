@@ -14,8 +14,11 @@ use crate::api::{Api, PAGE_SIZE};
 use crate::config::Config;
 use crate::input::{Gamepads, NavAction, key_to_action};
 use crate::launch;
+use crate::libretro::cores::{self, NoCore};
+use crate::libretro::emu::Emulator;
 use crate::logging;
 use crate::models::{Page, Platform, Rom, human_size};
+use crate::play;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Screen {
@@ -23,6 +26,7 @@ enum Screen {
     Library,
     Settings,
     Logs,
+    Play,
 }
 
 /// Results coming back from worker threads.
@@ -30,12 +34,23 @@ enum Msg {
     Connected(Api, String),
     ConnectFailed(String),
     Platforms(Vec<Platform>),
-    Roms { page: Page<Rom>, offset: i64 },
+    Roms {
+        page: Page<Rom>,
+        offset: i64,
+    },
     Failed(String),
     Cover(i64, Option<Arc<[u8]>>),
     Progress(i64, u64, Option<u64>),
     Downloaded(i64, PathBuf),
     DownloadFailed(i64, String),
+    /// A core has been fetched and the ROM read; ready to start emulating.
+    GameReady {
+        core_path: PathBuf,
+        rom_path: PathBuf,
+        rom: Vec<u8>,
+        title: String,
+    },
+    GameFailed(String),
 }
 
 struct Download {
@@ -103,6 +118,18 @@ pub struct RustRomm {
     /// Set when a launch is attempted with nothing configured, so the user
     /// lands on the exact field that needs filling in rather than a wall of them.
     needs_emulator_for: Option<String>,
+
+    // Embedded emulation
+    /// The running game, if any. Dropping it stops the emulation thread and
+    /// unloads the core.
+    emulator: Option<Emulator>,
+    /// The texture the game is drawn into. Reused across frames — allocating a
+    /// new one every frame leaks GPU memory until the driver gives up.
+    game_texture: Option<egui::TextureHandle>,
+    game_title: String,
+    /// Set while a core is downloading, so Play does not look like it did
+    /// nothing during the first-run fetch.
+    preparing: Option<String>,
 }
 
 impl RustRomm {
@@ -151,6 +178,10 @@ impl RustRomm {
             remembered_selection: HashMap::new(),
             gamepads: Gamepads::new(),
             needs_emulator_for: None,
+            emulator: None,
+            game_texture: None,
+            game_title: String::new(),
+            preparing: None,
         };
 
         // Saved credentials mean we can go straight to the library.
@@ -223,6 +254,7 @@ impl RustRomm {
             Screen::Library => self.library_screen(ui),
             Screen::Settings => self.settings_screen(ui),
             Screen::Logs => self.logs_screen(ui),
+            Screen::Play => self.play_screen(ui),
         }
     }
 
@@ -571,6 +603,36 @@ impl RustRomm {
                     }
                     self.status = Some(format!("Saved to {}", path.display()));
                 }
+                Msg::GameReady {
+                    core_path,
+                    rom_path,
+                    rom,
+                    title,
+                } => {
+                    self.preparing = None;
+                    let dirs = self.config.system_dir();
+                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, None) {
+                        Ok(emu) => {
+                            logging::info(format!(
+                                "playing {title} on {} {}",
+                                emu.info.name, emu.info.version
+                            ));
+                            self.game_title = title;
+                            self.game_texture = None;
+                            self.emulator = Some(emu);
+                            self.screen = Screen::Play;
+                        }
+                        Err(e) => {
+                            logging::error(format!("could not start {title}: {e:#}"));
+                            self.status = Some(format!("{e:#}"));
+                        }
+                    }
+                }
+                Msg::GameFailed(e) => {
+                    self.preparing = None;
+                    logging::error(format!("could not prepare game: {e}"));
+                    self.status = Some(e);
+                }
                 Msg::DownloadFailed(id, e) => {
                     logging::error(format!("download {id} failed: {e}"));
                     if let Some(d) = self.downloads.get_mut(&id) {
@@ -580,6 +642,205 @@ impl RustRomm {
                 }
             }
         }
+    }
+}
+
+impl RustRomm {
+    /// Play a downloaded ROM.
+    ///
+    /// Embedded emulation is the default and the point of the app. The external
+    /// launcher survives only for platforms with no embedded core — PSP, N64,
+    /// arcade — where standalone emulators are better anyway and we deliberately
+    /// refuse the hardware rendering they need.
+    fn start_playing(&mut self, ctx: &egui::Context, rom: &Rom, path: PathBuf) {
+        let spec = match cores::core_for_platform(&rom.platform_slug) {
+            Ok(spec) => spec,
+            Err(reason) => return self.launch_externally(rom, path, reason),
+        };
+
+        // BIOS is checked here, before the core is ever called, because a
+        // missing one is not reliably a clean refusal — Handy segfaults inside
+        // retro_load_game without lynxboot.img, and by then the process is gone.
+        let system_dir = self.config.system_dir();
+        let _ = std::fs::create_dir_all(&system_dir);
+        let missing = cores::missing_bios(&spec, &system_dir);
+        if !missing.is_empty() {
+            let msg = format!(
+                "{} needs {} in {} before it can run. Put the file there and try again.",
+                rom.platform_display_name,
+                missing.join(" and "),
+                system_dir.display()
+            );
+            logging::warn(format!(
+                "refusing to load {} — missing BIOS {:?}; some cores crash rather than \
+                 reporting this",
+                spec.name, missing
+            ));
+            self.status = Some(msg);
+            return;
+        }
+
+        self.preparing = Some(format!("Preparing {}…", spec.display));
+        self.status = None;
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        let cores_dir = self.config.cores_dir();
+        let title = rom.title().to_string();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::new();
+            let msg = (|| -> anyhow::Result<Msg> {
+                let core_path = cores::ensure_core(&client, &cores_dir, spec.name)?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
+                Ok(Msg::GameReady {
+                    core_path,
+                    rom_path: path,
+                    rom: bytes,
+                    title,
+                })
+            })()
+            .unwrap_or_else(|e| Msg::GameFailed(format!("{e:#}")));
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The old launcher path, now reached only where no embedded core exists.
+    fn launch_externally(&mut self, rom: &Rom, path: PathBuf, reason: NoCore) {
+        match self.config.emulator_for(&rom.platform_slug) {
+            Some(cmd) => {
+                logging::info(format!("launching {} via `{cmd}`", rom.title()));
+                self.status = Some(match launch::launch(cmd, &path) {
+                    Ok(()) => format!("Launched {} in your emulator", rom.title()),
+                    Err(e) => {
+                        logging::error(format!("launch failed: {e:#}"));
+                        format!("{e:#}")
+                    }
+                });
+            }
+            None => {
+                // Says *why* there is no embedded core, rather than a bare
+                // "configure an emulator". The distinction is real and
+                // permanent: PSP needs a GPU core we deliberately never
+                // provide, so no future version will play it in-app.
+                self.status = Some(format!("{} Set one up below.", reason.message()));
+                logging::warn(format!(
+                    "no embedded core for '{}': {}",
+                    rom.platform_slug,
+                    reason.message()
+                ));
+                self.needs_emulator_for = Some(rom.platform_slug.clone());
+                self.screen = Screen::Settings;
+            }
+        }
+    }
+
+    /// Stop the running game and go back to the library.
+    fn stop_playing(&mut self) {
+        // Dropping the Emulator joins the emulation thread, which unloads the
+        // core and releases the one-core-per-process slot. Without the join, the
+        // next game would fail to start.
+        self.emulator = None;
+        self.game_texture = None;
+        self.screen = Screen::Library;
+    }
+
+    fn play_screen(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        let Some(emu) = self.emulator.as_ref() else {
+            self.screen = Screen::Library;
+            return;
+        };
+
+        // The emulation thread runs on its own clock and produces no window
+        // events, so without an explicit repaint request the picture freezes
+        // until the mouse moves.
+        ctx.request_repaint();
+
+        if emu.finished() {
+            logging::info("game ended");
+            self.stop_playing();
+            return;
+        }
+
+        // Read input before drawing, so the newest press reaches the core as
+        // early as possible.
+        let mut mask = ctx.input(|i| play::retropad_from_keys(|k| i.key_down(k)));
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        #[cfg(feature = "gamepad")]
+        {
+            let (pad_mask, x, y) = self.gamepads.retropad_state();
+            mask = play::apply_stick(mask | pad_mask, x, y);
+        }
+        emu.set_buttons(0, mask);
+
+        let aspect = emu.av.aspect_ratio;
+        let frame = emu.frame();
+        let paused = emu.is_paused();
+        let fps = emu.measured_fps();
+        let target_fps = emu.av.fps;
+        let core_name = emu.info.name.clone();
+
+        egui::Panel::top("play_bar").show(root, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Stop").clicked() {
+                    self.emulator = None;
+                }
+                if let Some(emu) = self.emulator.as_ref() {
+                    if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                        emu.set_paused(!paused);
+                    }
+                    if ui.button("Reset").clicked() {
+                        emu.reset();
+                    }
+                }
+                ui.separator();
+                ui.label(&self.game_title);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Shown because a game running at 45 fps looks like a
+                    // stutter and is impossible to report without a number.
+                    let slow = fps > 1.0 && (fps as f64) < target_fps * 0.95;
+                    let text = format!("{fps:.1} fps");
+                    if slow {
+                        ui.colored_label(egui::Color32::from_rgb(230, 160, 60), text);
+                    } else {
+                        ui.weak(text);
+                    }
+                    ui.weak(&core_name);
+                });
+            });
+        });
+
+        if self.emulator.is_none() {
+            self.stop_playing();
+            return;
+        }
+        if escape {
+            self.stop_playing();
+            return;
+        }
+
+        egui::CentralPanel::default_margins().show(root, |ui| {
+            let Some(frame) = frame else {
+                ui.centered_and_justified(|ui| {
+                    ui.spinner();
+                });
+                return;
+            };
+            play::upload(&ctx, &mut self.game_texture, &frame);
+            let Some(texture) = self.game_texture.as_ref() else {
+                return;
+            };
+
+            let size = play::placement(&frame, aspect, ui.available_size());
+            // Black around the game rather than the app background: it reads as
+            // a screen bezel instead of a layout mistake.
+            let rect = ui.available_rect_before_wrap();
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+            ui.centered_and_justified(|ui| {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+            });
+        });
     }
 }
 
@@ -971,41 +1232,7 @@ impl RustRomm {
             self.start_download(ctx, &rom);
         }
         if let Some((rom, path)) = to_launch {
-            match self.config.emulator_for(&rom.platform_slug) {
-                Some(cmd) => {
-                    logging::info(format!(
-                        "launching {} via `{cmd}` -> {}",
-                        rom.title(),
-                        path.display()
-                    ));
-                    self.status = Some(match launch::launch(cmd, &path) {
-                        Ok(()) => format!("Launched {}", rom.title()),
-                        Err(e) => {
-                            logging::error(format!("launch failed: {e:#}"));
-                            format!("{e:#}")
-                        }
-                    });
-                }
-                None => {
-                    // Deliberately NOT falling back to the system opener. No OS
-                    // ships a handler for .gbc or .smc, so it fails for exactly
-                    // the case it would be reached in — and on macOS it fails
-                    // *after* spawning, which used to be reported as success.
-                    // Send them somewhere they can fix it instead.
-                    self.status = Some(format!(
-                        "No emulator set for {}. Pick one below — {} is already downloaded.",
-                        rom.platform_display_name,
-                        path.display()
-                    ));
-                    logging::warn(format!(
-                        "no emulator configured for platform '{}' — not falling back to the \
-                         system opener, which has no handler for these file types",
-                        rom.platform_slug
-                    ));
-                    self.needs_emulator_for = Some(rom.platform_slug.clone());
-                    self.screen = Screen::Settings;
-                }
-            }
+            self.start_playing(ctx, &rom, path);
         }
         if let Some(path) = to_reveal {
             if let Err(e) = launch::open_with_os(&path) {

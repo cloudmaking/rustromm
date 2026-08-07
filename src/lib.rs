@@ -11,3 +11,4 @@ pub mod launch;
 pub mod libretro;
 pub mod logging;
 pub mod models;
+pub mod play;

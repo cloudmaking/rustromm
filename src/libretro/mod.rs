@@ -9,5 +9,7 @@
 //! cores rather than read out of the header. See `docs/libretro-spike.md`.
 
 pub mod core;
+pub mod cores;
+pub mod emu;
 pub mod sys;
 pub mod video;

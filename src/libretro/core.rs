@@ -721,9 +721,7 @@ impl Core {
     /// atomically — a partially-applied mask would let the core see a
     /// combination the player never pressed.
     pub fn set_buttons(&self, port: usize, mask: u16) {
-        if port < MAX_PORTS {
-            shared().buttons[port].store(mask, Ordering::Relaxed);
-        }
+        set_buttons_global(port, mask);
     }
 
     /// The latest frame, if the core has produced one.
@@ -893,6 +891,24 @@ fn cstr_to_string(p: *const c_char) -> Option<String> {
         return None;
     }
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
+/// Set a port's buttons without holding a `Core`.
+///
+/// The core is owned by the emulation thread, but input comes from the UI
+/// thread and must not wait for a channel — a queued press arrives a frame
+/// late, and input latency is the whole reason this project exists. Writing
+/// the same process-global atomics the callback reads is both lock-free and
+/// honest: there is only ever one core.
+pub fn set_buttons_global(port: usize, mask: u16) {
+    if port < MAX_PORTS {
+        shared().buttons[port].store(mask, Ordering::Relaxed);
+    }
+}
+
+/// Core diagnostics without holding a `Core`, for the Logs tab.
+pub fn diagnostics_global() -> Diagnostics {
+    lock(&shared().diagnostics).clone()
 }
 
 /// Where a core's shared library lives on disk for the running platform.
