@@ -124,7 +124,7 @@ On Linux you may also need the usual GUI development libraries:
 ```sh
 sudo apt install libxkbcommon-dev libwayland-dev libx11-dev \
                  libxcursor-dev libxrandr-dev libxi-dev \
-                 libudev-dev libgtk-3-dev
+                 libudev-dev libgtk-3-dev libasound2-dev
 ```
 
 ## Using it

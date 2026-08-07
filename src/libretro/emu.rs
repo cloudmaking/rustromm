@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::audio::{AudioBuffer, Resampler};
 use super::core::{AvInfo, Core, CoreInfo, Diagnostics};
 use super::video::Frame;
 use crate::logging;
@@ -111,6 +112,7 @@ impl Emulator {
         system_dir: PathBuf,
         save_dir: PathBuf,
         initial_sram: Option<Vec<u8>>,
+        audio: Option<Arc<Mutex<AudioBuffer>>>,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             frame: Mutex::new(None),
@@ -140,6 +142,7 @@ impl Emulator {
                     system_dir,
                     save_dir,
                     initial_sram,
+                    audio,
                 )
             })?;
 
@@ -261,6 +264,7 @@ fn run_thread(
     system_dir: PathBuf,
     save_dir: PathBuf,
     initial_sram: Option<Vec<u8>>,
+    audio: Option<Arc<Mutex<AudioBuffer>>>,
 ) {
     let mut core = match Core::load(&core_path, &system_dir, &save_dir) {
         Ok(c) => c,
@@ -298,6 +302,11 @@ fn run_thread(
     if ready.send(Ok((info, av))).is_err() {
         return; // The caller gave up; nothing to run for.
     }
+
+    // Built from the rate the core reported, which is rarely a round number:
+    // 32040 Hz on Snes9x, 131072 on mGBA.
+    let mut resampler = Resampler::new(av.sample_rate);
+    let mut resampled: Vec<f32> = Vec::with_capacity(4096);
 
     let period = Duration::from_secs_f64(1.0 / av.fps);
     let mut deadline = Instant::now() + period;
@@ -344,10 +353,23 @@ fn run_thread(
 
         core.run();
 
-        // Audio is drained and dropped until the audio thread lands. Draining
-        // is not optional: the callback appends to a Vec on every frame, so
-        // ignoring it grows the heap without limit for as long as the game runs.
-        let _ = core.drain_audio();
+        // Draining is not optional even without a device: the callback appends
+        // to a Vec every frame, so ignoring it grows the heap without limit for
+        // as long as the game runs.
+        let raw = core.drain_audio();
+        if let Some(sink) = audio.as_ref() {
+            if !raw.is_empty() {
+                resampled.clear();
+                resampler.process(&raw, &mut resampled);
+                let mut buf = sink.lock().unwrap_or_else(|e| e.into_inner());
+                buf.push(&resampled);
+                // Nudge the ratio towards holding the buffer at its target.
+                // Without this the emulation clock and the sound card clock
+                // drift apart and the buffer eventually empties or overflows —
+                // either way, clicks.
+                resampler.adjust(buf.fullness());
+            }
+        }
 
         if let Some(f) = core.take_frame() {
             *shared.frame.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);

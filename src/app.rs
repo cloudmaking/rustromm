@@ -130,6 +130,13 @@ pub struct RustRomm {
     /// Set while a core is downloading, so Play does not look like it did
     /// nothing during the first-run fetch.
     preparing: Option<String>,
+    /// The sound device, opened once and kept for the life of the app.
+    ///
+    /// Opening it per game would add an audible gap at the start of every one,
+    /// and on some drivers repeated open/close leaks. `None` means no sound
+    /// card, which must not stop a game running — a silent game beats a game
+    /// that refuses to start, and CI has no sound card at all.
+    audio: Option<crate::libretro::audio::AudioOutput>,
 }
 
 impl RustRomm {
@@ -182,6 +189,7 @@ impl RustRomm {
             game_texture: None,
             game_title: String::new(),
             preparing: None,
+            audio: None,
         };
 
         // Saved credentials mean we can go straight to the library.
@@ -611,7 +619,19 @@ impl RustRomm {
                 } => {
                     self.preparing = None;
                     let dirs = self.config.system_dir();
-                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, None) {
+                    // Opened lazily: a user who never plays anything never
+                    // touches the sound device.
+                    if self.audio.is_none() {
+                        match crate::libretro::audio::AudioOutput::open() {
+                            Ok(out) => self.audio = Some(out),
+                            Err(e) => logging::warn(format!(
+                                "no audio output ({e:#}) — the game will run silently"
+                            )),
+                        }
+                    }
+                    let sink = self.audio.as_ref().map(|a| Arc::clone(&a.buffer));
+                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, None, sink)
+                    {
                         Ok(emu) => {
                             logging::info(format!(
                                 "playing {title} on {} {}",

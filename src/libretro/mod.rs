@@ -8,6 +8,7 @@
 //! Every claim about how cores behave here was measured against seven real
 //! cores rather than read out of the header. See `docs/libretro-spike.md`.
 
+pub mod audio;
 pub mod core;
 pub mod cores;
 pub mod emu;
