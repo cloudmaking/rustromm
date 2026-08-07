@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::audio::{AudioBuffer, Resampler};
+use super::content;
 use super::core::{AvInfo, Core, CoreInfo, Diagnostics};
 use super::saves;
 use super::video::Frame;
@@ -109,7 +110,6 @@ impl Emulator {
     pub fn start(
         core_path: PathBuf,
         rom_path: PathBuf,
-        rom: Vec<u8>,
         system_dir: PathBuf,
         save_dir: PathBuf,
         audio: Option<Arc<Mutex<AudioBuffer>>>,
@@ -138,7 +138,6 @@ impl Emulator {
                     ready_tx,
                     core_path,
                     rom_path,
-                    rom,
                     system_dir,
                     save_dir,
                     audio,
@@ -259,7 +258,6 @@ fn run_thread(
     ready: Sender<Ready>,
     core_path: PathBuf,
     rom_path: PathBuf,
-    rom: Vec<u8>,
     system_dir: PathBuf,
     save_dir: PathBuf,
     audio: Option<Arc<Mutex<AudioBuffer>>>,
@@ -275,7 +273,20 @@ fn run_thread(
     let info = core.info().clone();
     logging::info(format!("loaded core {} {}", info.name, info.version));
 
-    let av = match core.load_game(&rom_path, rom) {
+    // Only now do we know what this core will accept, which is what decides
+    // whether the download needs unpacking first. RomM serves plenty of games
+    // as .zip and most cores cannot read one.
+    let (content_path, rom) =
+        match content::prepare(&rom_path, &info.extensions, &save_dir.join("extracted")) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                shared.finished.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+
+    let av = match core.load_game(&content_path, rom) {
         Ok(av) => av,
         Err(e) => {
             let _ = ready.send(Err(e));

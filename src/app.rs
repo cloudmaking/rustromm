@@ -47,7 +47,6 @@ enum Msg {
     GameReady {
         core_path: PathBuf,
         rom_path: PathBuf,
-        rom: Vec<u8>,
         title: String,
     },
     GameFailed(String),
@@ -614,7 +613,6 @@ impl RustRomm {
                 Msg::GameReady {
                     core_path,
                     rom_path,
-                    rom,
                     title,
                 } => {
                     self.preparing = None;
@@ -630,7 +628,7 @@ impl RustRomm {
                         }
                     }
                     let sink = self.audio.as_ref().map(|a| Arc::clone(&a.buffer));
-                    match Emulator::start(core_path, rom_path, rom, dirs.clone(), dirs, sink) {
+                    match Emulator::start(core_path, rom_path, dirs.clone(), dirs, sink) {
                         Ok(emu) => {
                             logging::info(format!(
                                 "playing {title} on {} {}",
@@ -709,12 +707,12 @@ impl RustRomm {
             let client = reqwest::blocking::Client::new();
             let msg = (|| -> anyhow::Result<Msg> {
                 let core_path = cores::ensure_core(&client, &cores_dir, spec.name)?;
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
+                // The ROM is read on the emulation thread, not here: whether it
+                // needs unpacking first depends on which extensions the core
+                // accepts, and that is only known once the core is loaded.
                 Ok(Msg::GameReady {
                     core_path,
                     rom_path: path,
-                    rom: bytes,
                     title,
                 })
             })()
